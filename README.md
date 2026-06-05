@@ -44,7 +44,7 @@ pulp validate
 | Promptable Accompanist (E1) | MIDI-conditioned generative instrument | **working, cross-format** — **AU (auval PASSES) + VST3 + CLAP + Standalone(.app)** — installable in Logic; generates from prompt + takes MIDI; **custom WebView UI** (prompt + controls, opt-in `-DPROMPTABLE_WEBVIEW_UI=ON`) |
 | Agent-Conducted Session (E2) | flagship — `.pulpset` of agent steers (numeric) replayed to audio | **working** — headless conductor replays commands → non-silent audio; conducted build measurably raises energy (seg0→seg2). Live MCP-agent layer is the demo extension |
 | Continuation Effect (E3) | seed → prefill → generated continuation | **working** — token-prefill (lossless) branch; continuation coherent with seed, non-silent |
-| Reference-surface (Phase 7) | Jam/Collider/all-in-one control surface | **working** — 4/4 surfaces validated (text/blend/notes/modes generate audio). Faithful React-UI app clones are a follow-on |
+| WebView UI (Phase 7) | custom editor — prompt box + control sliders, bridged to the engine | **working** — opt-in (`-DPROMPTABLE_WEBVIEW_UI=ON`); auval SUCCEEDED with a Cocoa view → shows in Logic; reference-surface (4/4) proves the control surface |
 
 See the delivery plan (`planning/2026-06-05-magenta-rt2-delivery-plan.md` in the private
 pulp-planning repo) for the phased roadmap.
