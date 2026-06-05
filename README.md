@@ -41,7 +41,7 @@ pulp validate
 
 | Demo | Kind | Status |
 |------|------|--------|
-| Promptable Accompanist (E1) | MIDI-conditioned generative instrument, VST3/AU/CLAP/standalone | planned |
+| Promptable Accompanist (E1) | MIDI-conditioned generative instrument | **working** — CLAP builds + dlopens, links `magentart::core`, smoke test green (VST3/AU additive) |
 | Agent-Conducted Session (E2) | flagship — agent steers a live standalone MRT2 over MCP | planned |
 | Continuation Effect (E3) | audio-in → prefill → generated continuation | planned |
 | Reference-suite clone (Phase 7) | Jam + Collider + all-in-one, cross-format | planned |
