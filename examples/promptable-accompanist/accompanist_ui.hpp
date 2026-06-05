@@ -9,6 +9,7 @@
 
 #include <pulp/view/view.hpp>
 #include <pulp/view/plugin_view_host.hpp>
+#include <pulp/view/window_host.hpp>
 #include <pulp/view/web_view.hpp>
 #include <pulp/view/theme.hpp>
 #include <pulp/runtime/log.hpp>
@@ -91,25 +92,42 @@ public:
     }
     ~AccompanistPane() override { detach_if_needed(); }
 
+    // Embed the native WebView child view. A DAW plugin host exposes a
+    // PluginViewHost; a standalone window exposes a WindowHost — attach to
+    // whichever is present (both implement attach_native_child_view /
+    // set_native_child_view_bounds / detach_native_child_view with a void*
+    // NativeViewHandle). Attaching ONLY through plugin_view_host() is why the
+    // standalone rendered blank — it has a WindowHost, not a PluginViewHost.
     void attach_if_needed() {
-        auto* host = plugin_view_host();
-        if (attached_ || !host || !panel_ || !panel_->native_handle()) return;
-        const auto size = host->get_size();
-        attached_ = host->attach_native_child_view(panel_->native_handle(), 0.0f, 0.0f,
-                                                   (float)size.width, (float)size.height);
+        if (attached_ || !panel_ || !panel_->native_handle()) return;
+        auto* nh = panel_->native_handle();
+        if (auto* host = plugin_view_host()) {
+            const auto s = host->get_size();
+            attached_ = host->attach_native_child_view(nh, 0.0f, 0.0f,
+                                                       (float)s.width, (float)s.height);
+        } else if (auto* wh = window_host()) {
+            const auto s = wh->get_content_size();
+            attached_ = wh->attach_native_child_view(nh, 0.0f, 0.0f,
+                                                     (float)s.width, (float)s.height);
+        }
         if (attached_) sync_to_host();
     }
     void sync_to_host() {
-        auto* host = plugin_view_host();
-        if (!attached_ || !host || !panel_ || !panel_->native_handle()) return;
-        const auto size = host->get_size();
-        host->set_native_child_view_bounds(panel_->native_handle(), 0.0f, 0.0f,
-                                           (float)size.width, (float)size.height);
+        if (!attached_ || !panel_ || !panel_->native_handle()) return;
+        auto* nh = panel_->native_handle();
+        if (auto* host = plugin_view_host()) {
+            const auto s = host->get_size();
+            host->set_native_child_view_bounds(nh, 0.0f, 0.0f, (float)s.width, (float)s.height);
+        } else if (auto* wh = window_host()) {
+            const auto s = wh->get_content_size();
+            wh->set_native_child_view_bounds(nh, 0.0f, 0.0f, (float)s.width, (float)s.height);
+        }
     }
     void detach_if_needed() {
-        auto* host = plugin_view_host();
-        if (!attached_ || !host || !panel_ || !panel_->native_handle()) { attached_ = false; return; }
-        host->detach_native_child_view(panel_->native_handle());
+        if (!attached_ || !panel_ || !panel_->native_handle()) { attached_ = false; return; }
+        auto* nh = panel_->native_handle();
+        if (auto* host = plugin_view_host()) host->detach_native_child_view(nh);
+        else if (auto* wh = window_host()) wh->detach_native_child_view(nh);
         attached_ = false;
     }
 
