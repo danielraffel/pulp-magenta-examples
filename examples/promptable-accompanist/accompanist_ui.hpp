@@ -17,6 +17,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
+#include <cstdint>
 
 namespace pulp::examples::accompanist {
 
@@ -74,6 +76,7 @@ public:
         view::WebViewOptions options;
         options.transparent_background = true;
         panel_ = view::WebViewPanel::create(options);
+        set_contains_native_overlay(true);  // so capture_view snapshots us
         if (!panel_) {
             runtime::log_warn("PromptableAccompanist: native WebView backend unavailable");
             return;
@@ -129,6 +132,12 @@ public:
         if (auto* host = plugin_view_host()) host->detach_native_child_view(nh);
         else if (auto* wh = window_host()) wh->detach_native_child_view(nh);
         attached_ = false;
+    }
+
+    // capture_view() calls this for our native-overlay subtree: return an
+    // in-process WKWebView snapshot so the WebView UI is headlessly capturable.
+    std::vector<std::uint8_t> capture_native_overlay_png(std::uint32_t, std::uint32_t) override {
+        return panel_ ? panel_->snapshot_png() : std::vector<std::uint8_t>{};
     }
 
 private:
