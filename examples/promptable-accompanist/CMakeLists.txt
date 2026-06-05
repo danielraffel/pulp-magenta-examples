@@ -5,7 +5,7 @@
 # _pulp_add_clap auto-discovers it by convention; listing it too would double-define
 # `clap_entry`. With no SOURCES, ${target}_Core is an INTERFACE library.
 pulp_add_plugin(PromptableAccompanist
-    FORMATS           CLAP
+    FORMATS           CLAP VST3 Standalone
     PLUGIN_NAME       "PromptableAccompanist"
     BUNDLE_ID         "com.pulp.magenta.accompanist"
     MANUFACTURER      "PulpMagenta"
@@ -29,4 +29,10 @@ if(PULP_HAS_CLAP AND APPLE)
     add_test(NAME clap-dlopen-PromptableAccompanist
         COMMAND bash -c "python3 -c \"import ctypes; ctypes.CDLL('${CMAKE_BINARY_DIR}/CLAP/PromptableAccompanist.clap/Contents/MacOS/PromptableAccompanist'); print('OK')\"")
     set_tests_properties(clap-dlopen-PromptableAccompanist PROPERTIES LABELS "validation;clap" TIMEOUT 20)
+endif()
+
+if(PULP_HAS_VST3 AND APPLE)
+    add_test(NAME vst3-dlopen-PromptableAccompanist
+        COMMAND bash -c "python3 -c \"import ctypes; ctypes.CDLL('${CMAKE_BINARY_DIR}/VST3/PromptableAccompanist.vst3/Contents/MacOS/PromptableAccompanist'); print('OK')\"")
+    set_tests_properties(vst3-dlopen-PromptableAccompanist PROPERTIES LABELS "validation;vst3" TIMEOUT 20)
 endif()
