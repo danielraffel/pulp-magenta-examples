@@ -5,7 +5,7 @@
 # _pulp_add_clap auto-discovers it by convention; listing it too would double-define
 # `clap_entry`. With no SOURCES, ${target}_Core is an INTERFACE library.
 pulp_add_plugin(PromptableAccompanist
-    FORMATS           CLAP VST3 Standalone
+    FORMATS           CLAP VST3 AU AUv3 Standalone
     PLUGIN_NAME       "PromptableAccompanist"
     BUNDLE_ID         "com.pulp.magenta.accompanist"
     MANUFACTURER      "PulpMagenta"
