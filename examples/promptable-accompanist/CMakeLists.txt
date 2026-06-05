@@ -1,9 +1,11 @@
 # Promptable Accompanist (E1) — MIDI-conditioned generative instrument on magentart::core.
 # CLAP-first (auto-fetched + dlopen-testable). Add VST3/AU/Standalone to FORMATS once their
 # SDKs are configured — the Processor is format-agnostic.
+# Header-only processor (accompanist.hpp). Don't list clap_entry.cpp in SOURCES —
+# _pulp_add_clap auto-discovers it by convention; listing it too would double-define
+# `clap_entry`. With no SOURCES, ${target}_Core is an INTERFACE library.
 pulp_add_plugin(PromptableAccompanist
     FORMATS           CLAP
-    SOURCES           clap_entry.cpp
     PLUGIN_NAME       "PromptableAccompanist"
     BUNDLE_ID         "com.pulp.magenta.accompanist"
     MANUFACTURER      "PulpMagenta"
@@ -12,8 +14,8 @@ pulp_add_plugin(PromptableAccompanist
     PLUGIN_CODE       "PMac"
     MANUFACTURER_CODE "PuMa"
 )
-# Link the Magenta inference core into the shared processor object library.
-target_link_libraries(PromptableAccompanist_Core PUBLIC magentart::core)
+# Propagate the Magenta inference core to the format targets via the INTERFACE core lib.
+target_link_libraries(PromptableAccompanist_Core INTERFACE magentart::core)
 
 if(PULP_BUILD_TESTS)
     add_executable(promptable-accompanist-test test_accompanist.cpp)
