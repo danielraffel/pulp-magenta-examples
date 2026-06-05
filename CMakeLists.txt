@@ -10,6 +10,13 @@ endif()
 
 find_package(Pulp REQUIRED)
 
+# `pulp build` (the CLI) resolves a published SDK whose PulpConfig fully exports the
+# plugin helpers. When consuming Pulp from a dev build TREE (Pulp_DIR=<pulp>/build) the
+# config can return before defining pulp_add_plugin, so include PulpUtils explicitly.
+if(NOT COMMAND pulp_add_plugin AND EXISTS "${Pulp_DIR}/PulpUtils.cmake")
+    include("${Pulp_DIR}/PulpUtils.cmake")
+endif()
+
 # Magenta inference core via the thin wrapper (exposes only magentart::core).
 add_subdirectory(magentart-wrapper)
 
