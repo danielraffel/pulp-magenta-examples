@@ -21,3 +21,4 @@ endif()
 add_subdirectory(magentart-wrapper)
 
 add_subdirectory(examples/promptable-accompanist)
+add_subdirectory(examples/agent-session)

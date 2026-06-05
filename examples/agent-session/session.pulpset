@@ -1,0 +1,12 @@
+# Agent-conducted arrangement — numeric steering (the stream an agent sends via
+# pulp_inspect_set_param). Frame = 1920 samples @ 48kHz (40 ms).
+0  prompt warm analog pads with sub bass
+0  temperature 1.0
+0  cfg_musiccoca 1.5
+0  top_k 40
+# build energy: raise temperature + prompt CFG
+15 temperature 1.4
+15 cfg_musiccoca 2.5
+# peak: hotter, narrower sampling
+30 temperature 1.7
+30 top_k 24
