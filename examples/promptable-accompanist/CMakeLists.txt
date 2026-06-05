@@ -20,7 +20,7 @@ if(PULP_BUILD_TESTS)
     target_link_libraries(promptable-accompanist-test
         PRIVATE pulp::format magentart::core Catch2::Catch2WithMain)
     target_include_directories(promptable-accompanist-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    catch_discover_tests(promptable-accompanist-test)
+    add_test(NAME promptable-accompanist-test COMMAND promptable-accompanist-test)
 endif()
 
 if(PULP_HAS_CLAP AND APPLE)
