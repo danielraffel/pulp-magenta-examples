@@ -1,24 +1,27 @@
-// Headless smoke test for the Promptable Accompanist processor. Validates the
-// instrument contract (descriptor + parameters) WITHOUT loading the model — so it
-// runs fast in CI and proves the magentart::core link + Processor wiring compile.
-#include <catch2/catch_test_macros.hpp>
+// Headless smoke test for the Promptable Accompanist processor. Validates the instrument
+// contract (descriptor + parameters) WITHOUT loading the model — so it runs fast and proves
+// the magentart::core link + Processor wiring compile. Plain main() (no Catch2): a downstream
+// SDK-consuming project doesn't get Catch2 from the Pulp SDK.
 #include "accompanist.hpp"
+#include <cstdio>
 
 using namespace pulp::examples::accompanist;
 
-TEST_CASE("Promptable Accompanist declares an instrument", "[accompanist][descriptor]") {
+#define CHECK(cond, msg) do { if (!(cond)) { std::printf("FAIL: %s\n", msg); return 1; } } while (0)
+
+int main() {
     Processor p;
     auto d = p.descriptor();
-    REQUIRE(d.category == pulp::format::PluginCategory::Instrument);
-    REQUIRE(d.accepts_midi);
-    REQUIRE(d.input_buses.empty());
-    REQUIRE(d.output_buses.size() == 1);
-    REQUIRE(d.output_buses[0].default_channels == 2);
-}
+    CHECK(d.category == pulp::format::PluginCategory::Instrument, "category is Instrument");
+    CHECK(d.accepts_midi, "accepts MIDI");
+    CHECK(d.input_buses.empty(), "no audio input bus");
+    CHECK(d.output_buses.size() == 1, "one output bus");
+    CHECK(d.output_buses[0].default_channels == 2, "stereo output");
 
-TEST_CASE("Promptable Accompanist registers automatable numeric params", "[accompanist][params]") {
-    Processor p;
     pulp::state::StateStore store;
     p.define_parameters(store);
-    REQUIRE(store.all_params().size() == 6);
+    CHECK(store.all_params().size() == 6, "six automatable params");
+
+    std::puts("OK: Promptable Accompanist instrument contract + 6 params");
+    return 0;
 }

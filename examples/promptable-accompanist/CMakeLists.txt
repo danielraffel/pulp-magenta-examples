@@ -18,7 +18,7 @@ target_link_libraries(PromptableAccompanist_Core PUBLIC magentart::core)
 if(PULP_BUILD_TESTS)
     add_executable(promptable-accompanist-test test_accompanist.cpp)
     target_link_libraries(promptable-accompanist-test
-        PRIVATE pulp::format magentart::core Catch2::Catch2WithMain)
+        PRIVATE Pulp::format magentart::core)
     target_include_directories(promptable-accompanist-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME promptable-accompanist-test COMMAND promptable-accompanist-test)
 endif()
