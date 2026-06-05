@@ -62,3 +62,26 @@ tracks the latest installed Pulp SDK and never goes stale. Override only to repr
 MLX produces a `.metallib` that must be placed + (re)signed inside the plugin/`.app` bundle.
 Magenta's app-side codesign machinery is **not** inherited by a `magentart::core`-only consumer,
 so Pulp's `ship` path must handle metallib placement when packaging these demos.
+
+## ⚠ Build prerequisite: an installed (or published) Pulp SDK
+
+Building these plugins needs Pulp consumed as an **installed SDK**, not from a dev build tree.
+A dev-tree `PulpConfig.cmake` (`Pulp_DIR=<pulp>/build`) is the *install-tree* template: it
+`include()`s `PulpTargets.cmake`/`PulpUtils.cmake` (which define `pulp_add_plugin`) as siblings
+that only exist **after `cmake --install`**. So:
+
+- **Normal path:** `pulp build` (the CLI) resolves a published SDK for the floating
+  `sdk_version="latest"` and exports the plugin helpers natively. Use this once an SDK release
+  is published.
+- **Local path (no published SDK):** build the **full** Pulp source tree, then install it:
+  ```bash
+  cmake --build /path/to/pulp/build -j          # must build ALL SDK targets (CLI, scan-worker, …)
+  cmake --install /path/to/pulp/build --prefix ~/pulp-sdk --config Release
+  cmake -S . -B build -DPulp_DIR=~/pulp-sdk/lib/cmake/Pulp \
+        -DSKIA_DIR=/path/to/pulp/external/skia-build   # uses cmake<3.28 (see above)
+  cmake --build build -j
+  ```
+  A partial source build makes `cmake --install` fail on the first unbuilt target.
+
+Everything else in this guide (Metal Toolchain, cmake<3.28, the MLX `e9e20fa` bump, headless
+weights) was validated end-to-end and is independent of this packaging step.
