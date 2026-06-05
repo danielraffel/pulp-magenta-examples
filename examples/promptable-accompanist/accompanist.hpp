@@ -55,9 +55,24 @@ inline std::string default_model() {
                   "Documents/Magenta/magenta-rt-v2/models/mrt2_small/mrt2_small.mlxfn").string());
 }
 
+// Heap engine state shared between the Processor and its worker thread, so the
+// Processor can be destroyed INSTANTLY (detach, no join) even while the worker is
+// mid-model-load. The worker holds a shared_ptr ref, finishes its current op,
+// sees `running=false`, and exits — releasing the state. This keeps host
+// instantiation/teardown fast (auval re-instantiates many times; a join-on-load
+// would make validation crawl / time out).
+struct EngineState {
+    magentart::core::MLXEngine engine;
+    magentart::core::RingBuffer ring_l, ring_r;
+    std::atomic<bool> running{true}, loaded{false}, load_failed{false};
+};
+
 class Processor : public format::Processor {
 public:
-    ~Processor() override { stop_worker(); }
+    ~Processor() override {
+        if (st_) st_->running.store(false);
+        if (worker_.joinable()) worker_.detach();   // instant teardown; worker self-exits
+    }
 
     format::PluginDescriptor descriptor() const override {
         return {
@@ -85,11 +100,12 @@ public:
 
     void prepare(const format::PrepareContext& ctx) override {
         sample_rate_ = ctx.sample_rate;
-        ring_l_.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
-        ring_r_.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
         if (!worker_started_.exchange(true)) {
-            running_.store(true);
-            worker_ = std::thread([this] { worker_run(); });
+            st_ = std::make_shared<EngineState>();
+            st_->ring_l.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
+            st_->ring_r.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
+            auto st = st_;                                 // worker holds a ref
+            worker_ = std::thread([st] { worker_run(st); });
         }
     }
 
@@ -98,26 +114,27 @@ public:
                  midi::MidiBuffer& midi_in,
                  midi::MidiBuffer&,
                  const format::ProcessContext&) override {
-        // Push atomic controls + MIDI to the engine (thread-safe from any thread).
-        engine_.set_temperature(state().get_value(kTemperature));
-        engine_.set_top_k(static_cast<int>(state().get_value(kTopK)));
-        engine_.set_cfg_musiccoca(state().get_value(kCfgMusicCoCa));
-        engine_.set_cfg_notes(state().get_value(kCfgNotes));
-        engine_.set_cfg_drums(state().get_value(kCfgDrums));
-        for (const auto& ev : midi_in) {
-            if (ev.is_note_on() && ev.velocity() > 0) engine_.set_note_on(ev.note());
-            else if (ev.is_note_off() || ev.is_note_on()) engine_.set_note_off(ev.note());
-        }
-
         const std::size_t nch = out.num_channels();
         const std::size_t ns  = out.num_samples();
         if (nch == 0 || ns == 0) return;
+        if (!st_) { for (std::size_t ch = 0; ch < nch; ++ch) { auto s = out.channel(ch); for (std::size_t i = 0; i < ns; ++i) s[i] = 0.0f; } return; }
+
+        // Push atomic controls + MIDI to the engine (thread-safe from any thread).
+        st_->engine.set_temperature(state().get_value(kTemperature));
+        st_->engine.set_top_k(static_cast<int>(state().get_value(kTopK)));
+        st_->engine.set_cfg_musiccoca(state().get_value(kCfgMusicCoCa));
+        st_->engine.set_cfg_notes(state().get_value(kCfgNotes));
+        st_->engine.set_cfg_drums(state().get_value(kCfgDrums));
+        for (const auto& ev : midi_in) {
+            if (ev.is_note_on() && ev.velocity() > 0) st_->engine.set_note_on(ev.note());
+            else if (ev.is_note_off() || ev.is_note_on()) st_->engine.set_note_off(ev.note());
+        }
 
         // Drain generated 48 kHz stereo from the ring (RT-safe; zero-padded on underrun).
         auto L = out.channel(0);
         auto R = out.channel(nch > 1 ? 1 : 0);
-        if (!ring_l_.read(L.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) L[i] = 0.0f; }
-        if (!ring_r_.read(R.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) R[i] = 0.0f; }
+        if (!st_->ring_l.read(L.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) L[i] = 0.0f; }
+        if (!st_->ring_r.read(R.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) R[i] = 0.0f; }
 
         const float gain = std::pow(10.0f, state().get_value(kVolumeDb) / 20.0f);
         for (std::size_t i = 0; i < ns; ++i) { L[i] *= gain; R[i] *= gain; }
@@ -128,45 +145,40 @@ public:
     }
 
 private:
-    void worker_run() {
+    static void worker_run(std::shared_ptr<EngineState> st) {
         using namespace std::chrono_literals;
         namespace mc = magentart::core;
         {
             magentart::detail::AutoreleasePool pool;
-            if (!engine_.init_assets(default_resources().c_str(), "musiccoca") ||
-                !engine_.load_model(default_model().c_str())) {
-                load_failed_.store(true);
+            if (!st->engine.init_assets(default_resources().c_str(), "musiccoca") ||
+                !st->engine.load_model(default_model().c_str())) {
+                st->load_failed.store(true);
                 return;
             }
-            engine_.set_text_prompt(env_or("MRT2_PROMPT", "warm analog pads"));
+            st->engine.set_text_prompt(env_or("MRT2_PROMPT", "warm analog pads"));
         }
-        while (running_.load() &&
-               (engine_.get_text_encoder_status() == 1 || engine_.get_quantizer_status() == 1))
+        while (st->running.load() &&
+               (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
             std::this_thread::sleep_for(10ms);
-        loaded_.store(true);
+        st->loaded.store(true);
 
         float L[mc::kFrameSamples], R[mc::kFrameSamples];
         const std::size_t headroom = mc::RingBuffer::kCapacity - 2 * mc::kFrameSamples;
-        while (running_.load()) {
-            if (ring_l_.available() > headroom) {            // ring nearly full → wait
+        while (st->running.load()) {
+            if (st->ring_l.available() > headroom) {        // ring nearly full → wait
                 std::this_thread::sleep_for(2ms);
                 continue;
             }
             magentart::detail::AutoreleasePool pool;
-            if (!engine_.generate_frame(L, R)) break;
-            ring_l_.write(L, mc::kFrameSamples);
-            ring_r_.write(R, mc::kFrameSamples);
+            if (!st->engine.generate_frame(L, R)) break;
+            st->ring_l.write(L, mc::kFrameSamples);
+            st->ring_r.write(R, mc::kFrameSamples);
         }
     }
-    void stop_worker() {
-        running_.store(false);
-        if (worker_.joinable()) worker_.join();
-    }
 
-    magentart::core::MLXEngine engine_;
-    magentart::core::RingBuffer ring_l_, ring_r_;
+    std::shared_ptr<EngineState> st_;
     std::thread worker_;
-    std::atomic<bool> worker_started_{false}, running_{false}, loaded_{false}, load_failed_{false};
+    std::atomic<bool> worker_started_{false};
     double sample_rate_ = 48000.0;
 };
 
