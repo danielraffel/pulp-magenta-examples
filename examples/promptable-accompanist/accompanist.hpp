@@ -32,6 +32,8 @@
 // omitted. The CMake option PROMPTABLE_WEBVIEW_UI defines ACCOMPANIST_WEBVIEW_UI.
 #ifdef ACCOMPANIST_WEBVIEW_UI
 #include "accompanist_ui.hpp"
+#else
+#include "accompanist_native_ui.hpp"  // GPU-native editor (Track B) — the default
 #endif
 
 #include <atomic>
@@ -168,6 +170,17 @@ public:
     }
     void on_view_closed(view::View& root) override {
         static_cast<AccompanistRoot&>(root).pane().detach_if_needed();
+    }
+#else
+    // ── GPU-native editor (Track B) — the default. Skia-drawn widgets to Magenta's
+    //    tokens; renders in every host AND is headlessly capturable. ──
+    format::ViewSize view_size() const override { return {560, 360, 460, 300, 1000, 720}; }
+
+    std::unique_ptr<view::View> create_view() override {
+        return make_accompanist_native_view(
+            [this](std::uint32_t id, float v) { state().set_normalized(id, v); },
+            [this](std::uint32_t id) { return state().get_normalized(id); },
+            env_or("MRT2_PROMPT", "warm analog pads"));
     }
 #endif
 
