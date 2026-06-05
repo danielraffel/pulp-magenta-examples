@@ -1,0 +1,7 @@
+# Floating-SDK mode (Pulp #2087): tracks the latest installed SDK on every build so the
+# demos never go stale. Pin a specific version only to reproduce a bug:
+#   pulp project pin <version>
+sdk_version = "latest"
+
+[project]
+name = "pulp-magenta-examples"
