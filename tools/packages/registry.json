@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/danielraffel/pulp/main/tools/packages/registry-schema.json",
+  "version": 2,
+  "packages": {
+    "magenta-realtime-2": {
+      "name": "Magenta RealTime 2 (magentart::core)",
+      "version": "wrapper-e9e20fa",
+      "description": "Google Magenta RealTime 2 on-device music model — C++ inference core (magentart::core). Apple Silicon only.",
+      "license": "Apache-2.0",
+      "category": "ml",
+      "homepage": "https://magenta.withgoogle.com/mrt2",
+      "fetch": {
+        "method": "FetchContent",
+        "git_repository": "https://github.com/danielraffel/pulp-magenta-examples.git",
+        "git_tag": "main"
+      },
+      "cmake": {
+        "targets": ["magentart::core"],
+        "header_only": false,
+        "include_dir": "magentart-wrapper"
+      },
+      "platforms": {
+        "macOS": {
+          "architectures": ["arm64"],
+          "min_version": "14.0",
+          "notes": "Apple Silicon only; requires Xcode Metal Toolchain (xcodebuild -downloadComponent MetalToolchain) and the MLX e9e20fa bump for Metal-26."
+        }
+      }
+    }
+  }
+}

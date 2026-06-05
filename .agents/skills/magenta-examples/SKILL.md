@@ -1,0 +1,52 @@
+---
+name: magenta-examples
+description: Bring Magenta RealTime 2 into a Pulp project and build/validate the MRT2 example plugins (cross-format, Apple Silicon). Handles the Metal Toolchain + MLX-26 prerequisites, headless weights, and `pulp add magenta-realtime-2`.
+requires:
+  scripts:
+    - scripts/install-weights.sh
+    - magentart-wrapper/CMakeLists.txt
+    - tools/packages/registry.json
+---
+
+# Magenta examples — bring-it-in skill
+
+Use when a user wants to run the MRT2 example plugins (Promptable Accompanist, Agent-Conducted
+Session, Continuation Effect) in Pulp, or to add `magentart::core` to a Pulp project.
+
+## Preconditions (check first, in order)
+
+1. **Apple Silicon + macOS 14+.** Otherwise stop — MRT2 is Metal/MLX-only.
+2. **Metal Toolchain installed:** `xcrun metal --version` must succeed. If not:
+   `xcodebuild -downloadComponent MetalToolchain` (~688 MB, one-time). This is the #1 gotcha —
+   the build links fine without it but **aborts at generation**.
+3. **`mrt` CLI:** `command -v mrt` — else `uv pip install "magenta-rt[mlx]"`.
+4. **cmake `<3.28`** in the active env (MRT2 pins ≥3.27, <3.28).
+
+## Steps
+
+```bash
+# weights (headless — pass the NAME, the default picker needs a TTY)
+./scripts/install-weights.sh mrt2_small        # mrt2_base needs a Pro/Max
+
+# bring Magenta in as a package (resolves the local tools/packages/registry.json entry,
+# which points at magentart-wrapper/ — NOT Magenta's root CMake)
+pulp add magenta-realtime-2
+
+pulp build
+pulp validate            # auval / clap-validator on the built formats
+```
+
+## Gotchas (validated)
+
+- The wrapper **pins MLX to `e9e20fa`** (Metal-26 fix). If you re-pin MLX on an existing build,
+  delete `_deps/mlx-*` first (a shallow clone can't update to an unrelated SHA).
+- MRT2 is **generative, ~200 ms latency** — MIDI steers; it does not deterministically play notes.
+  Set that expectation in any UX copy.
+- Validate plugins with Pulp's test harness / `pulp validate` before installing to system folders.
+- CC-BY-4.0 weight attribution must travel into any shipped bundle (see `NOTICE.md`).
+
+## Update rule
+
+When you discover a new MRT2/Pulp integration gotcha (a build prereq, a wrapper quirk, a
+format-validation trap), add it here — this skill is the single source of truth for getting the
+demos running.
