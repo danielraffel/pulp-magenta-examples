@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -180,6 +181,14 @@ public:
         return make_accompanist_native_view(
             [this](std::uint32_t id, float v) { state().set_normalized(id, v); },
             [this](std::uint32_t id) { return state().get_normalized(id); },
+            [this](std::uint32_t id) -> std::string {
+                const float v = state().get_value(id);
+                char buf[32];
+                if (id == kTopK)            std::snprintf(buf, sizeof buf, "%d", (int)std::lround(v));
+                else if (id == kTemperature) std::snprintf(buf, sizeof buf, "%.2f", v);
+                else                         std::snprintf(buf, sizeof buf, "%.1f", v);
+                return buf;
+            },
             env_or("MRT2_PROMPT", "warm analog pads"));
     }
 #endif

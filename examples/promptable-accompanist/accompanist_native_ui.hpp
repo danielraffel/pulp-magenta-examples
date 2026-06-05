@@ -18,8 +18,9 @@
 
 namespace pulp::examples::accompanist {
 
-using SetParamNorm = std::function<void(std::uint32_t, float)>;   // normalized 0..1
+using SetParamNorm = std::function<void(std::uint32_t, float)>;        // normalized 0..1
 using GetParamNorm = std::function<float(std::uint32_t)>;
+using FmtParam     = std::function<std::string(std::uint32_t)>;       // formatted actual value
 
 // Magenta tokens (examples/common/react_ui/colors.ts).
 namespace mag {
@@ -32,7 +33,8 @@ inline canvas::Color subtext()  { return canvas::Color::rgba8(0x9A, 0xA0, 0xB2);
 
 class AccompanistNativeRoot final : public view::View {
 public:
-    AccompanistNativeRoot(SetParamNorm set_p, GetParamNorm get_p, std::string prompt) {
+    AccompanistNativeRoot(SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt,
+                          std::string prompt) {
         set_theme(view::Theme::dark());
         set_background_color(mag::grey900());
         flex().direction = view::FlexDirection::column;
@@ -79,18 +81,32 @@ public:
             fader->set_orientation(view::Fader::Orientation::horizontal);
             fader->flex().flex_grow = 1;
             if (get_p) fader->set_value(get_p(i));
-            fader->on_change = [i, set_p](float v) { if (set_p) set_p(i, v); };
             row->add_child(std::move(fader));
 
+            auto val = std::make_unique<view::Label>(fmt ? fmt(i) : std::string());
+            val->set_font_size(13);
+            val->set_text_color(mag::lightBlue());
+            val->set_text_align(view::LabelAlign::right);
+            val->flex().preferred_width = 52;
+            view::Label* val_ptr = val.get();
+            row->add_child(std::move(val));
+
+            // Live: moving the fader updates the param + the value readout.
+            if (auto* f = dynamic_cast<view::Fader*>(row->child_at(1))) {
+                f->on_change = [i, set_p, fmt, val_ptr](float v) {
+                    if (set_p) set_p(i, v);
+                    if (fmt && val_ptr) val_ptr->set_text(fmt(i));
+                };
+            }
             add_child(std::move(row));
         }
     }
 };
 
 inline std::unique_ptr<view::View> make_accompanist_native_view(
-    SetParamNorm set_p, GetParamNorm get_p, std::string prompt) {
+    SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt, std::string prompt) {
     return std::make_unique<AccompanistNativeRoot>(std::move(set_p), std::move(get_p),
-                                                   std::move(prompt));
+                                                   std::move(fmt), std::move(prompt));
 }
 
 }  // namespace pulp::examples::accompanist
