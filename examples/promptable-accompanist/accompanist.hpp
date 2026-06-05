@@ -27,6 +27,13 @@
 #include <magentart/ring_buffer.h>
 #include <magentart/detail/autorelease_pool.h>
 
+// The custom WebView UI needs an SDK built with -DPULP_BUILD_WEBVIEW=ON. Without it the
+// plugin still works fully (audio + host/auto param UI); only the bespoke editor is
+// omitted. The CMake option PROMPTABLE_WEBVIEW_UI defines ACCOMPANIST_WEBVIEW_UI.
+#ifdef ACCOMPANIST_WEBVIEW_UI
+#include "accompanist_ui.hpp"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -143,6 +150,26 @@ public:
             for (std::size_t i = 0; i < ns; ++i) s[i] = L[i];
         }
     }
+
+#ifdef ACCOMPANIST_WEBVIEW_UI
+    // ── WebView UI (Phase 7) — prompt + numeric controls, bridged to the engine. ──
+    format::ViewSize view_size() const override { return {520, 430, 420, 320, 1000, 760}; }
+
+    std::unique_ptr<view::View> create_view() override {
+        return std::make_unique<AccompanistRoot>(
+            [this](std::uint32_t id, float v) { state().set_value(id, v); },
+            [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); });
+    }
+    void on_view_opened(view::View& root) override {
+        static_cast<AccompanistRoot&>(root).pane().attach_if_needed();
+    }
+    void on_view_resized(view::View& root, std::uint32_t, std::uint32_t) override {
+        static_cast<AccompanistRoot&>(root).pane().sync_to_host();
+    }
+    void on_view_closed(view::View& root) override {
+        static_cast<AccompanistRoot&>(root).pane().detach_if_needed();
+    }
+#endif
 
 private:
     static void worker_run(std::shared_ptr<EngineState> st) {

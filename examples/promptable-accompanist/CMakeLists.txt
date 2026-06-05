@@ -17,10 +17,22 @@ pulp_add_plugin(PromptableAccompanist
 # Propagate the Magenta inference core to the format targets via the INTERFACE core lib.
 target_link_libraries(PromptableAccompanist_Core INTERFACE magentart::core)
 
+# Optional custom WebView editor UI (prompt box + control sliders bridged to the engine).
+# Requires a Pulp SDK built with -DPULP_BUILD_WEBVIEW=ON; default OFF so the demo builds
+# against any published SDK (the plugin still works — audio + the host/auto param UI).
+option(PROMPTABLE_WEBVIEW_UI "Build the custom WebView editor UI (needs SDK -DPULP_BUILD_WEBVIEW=ON)" OFF)
+if(PROMPTABLE_WEBVIEW_UI)
+    target_compile_definitions(PromptableAccompanist_Core INTERFACE ACCOMPANIST_WEBVIEW_UI=1)
+    target_link_libraries(PromptableAccompanist_Core INTERFACE Pulp::view)
+endif()
+
 if(PULP_BUILD_TESTS)
     add_executable(promptable-accompanist-test test_accompanist.cpp)
-    target_link_libraries(promptable-accompanist-test
-        PRIVATE Pulp::format magentart::core)
+    target_link_libraries(promptable-accompanist-test PRIVATE Pulp::format magentart::core)
+    if(PROMPTABLE_WEBVIEW_UI)
+        target_compile_definitions(promptable-accompanist-test PRIVATE ACCOMPANIST_WEBVIEW_UI=1)
+        target_link_libraries(promptable-accompanist-test PRIVATE Pulp::view)
+    endif()
     target_include_directories(promptable-accompanist-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME promptable-accompanist-test COMMAND promptable-accompanist-test)
 endif()
