@@ -43,7 +43,7 @@ pulp validate
 |------|------|--------|
 | Promptable Accompanist (E1) | MIDI-conditioned generative instrument | **working** — CLAP builds + dlopens, links `magentart::core`, smoke test green (VST3/AU additive) |
 | Agent-Conducted Session (E2) | flagship — `.pulpset` of agent steers (numeric) replayed to audio | **working** — headless conductor replays commands → non-silent audio; conducted build measurably raises energy (seg0→seg2). Live MCP-agent layer is the demo extension |
-| Continuation Effect (E3) | audio-in → prefill → generated continuation | planned |
+| Continuation Effect (E3) | seed → prefill → generated continuation | **working** — token-prefill (lossless) branch; continuation coherent with seed, non-silent |
 | Reference-suite clone (Phase 7) | Jam + Collider + all-in-one, cross-format | planned |
 
 See the delivery plan (`planning/2026-06-05-magenta-rt2-delivery-plan.md` in the private
