@@ -189,6 +189,7 @@ public:
                 else                         std::snprintf(buf, sizeof buf, "%.1f", v);
                 return buf;
             },
+            [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); },
             env_or("MRT2_PROMPT", "warm analog pads"));
     }
 #endif

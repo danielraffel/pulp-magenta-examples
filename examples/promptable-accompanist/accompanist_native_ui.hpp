@@ -8,6 +8,7 @@
 
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
+#include <pulp/view/text_editor.hpp>
 #include <pulp/view/theme.hpp>
 #include <pulp/canvas/canvas.hpp>
 
@@ -21,6 +22,7 @@ namespace pulp::examples::accompanist {
 using SetParamNorm = std::function<void(std::uint32_t, float)>;        // normalized 0..1
 using GetParamNorm = std::function<float(std::uint32_t)>;
 using FmtParam     = std::function<std::string(std::uint32_t)>;       // formatted actual value
+using SetPrompt    = std::function<void(const std::string&)>;         // → engine.set_text_prompt
 
 // Magenta tokens (examples/common/react_ui/colors.ts).
 namespace mag {
@@ -34,7 +36,7 @@ inline canvas::Color subtext()  { return canvas::Color::rgba8(0x9A, 0xA0, 0xB2);
 class AccompanistNativeRoot final : public view::View {
 public:
     AccompanistNativeRoot(SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt,
-                          std::string prompt) {
+                          SetPrompt set_prompt, std::string prompt) {
         set_theme(view::Theme::dark());
         set_background_color(mag::grey900());
         flex().direction = view::FlexDirection::column;
@@ -55,12 +57,15 @@ public:
         sub->flex().preferred_height = 16;
         add_child(std::move(sub));
 
-        auto prompt_box = std::make_unique<view::Label>(
-            prompt.empty() ? std::string("warm analog pads") : prompt);
+        auto prompt_box = std::make_unique<view::TextEditor>();
+        prompt_box->set_text(prompt.empty() ? std::string("warm analog pads") : prompt);
+        prompt_box->placeholder = "describe the music…";
         prompt_box->set_font_size(14);
-        prompt_box->set_text_color(mag::text());
         prompt_box->set_background_color(mag::panel());
         prompt_box->flex().preferred_height = 44;
+        prompt_box->on_change = [set_prompt](const std::string& t) {
+            if (set_prompt) set_prompt(t);
+        };
         add_child(std::move(prompt_box));
 
         static const char* kNames[6] = {"Temperature", "Top K", "Prompt CFG",
@@ -104,9 +109,11 @@ public:
 };
 
 inline std::unique_ptr<view::View> make_accompanist_native_view(
-    SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt, std::string prompt) {
+    SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt, SetPrompt set_prompt,
+    std::string prompt) {
     return std::make_unique<AccompanistNativeRoot>(std::move(set_p), std::move(get_p),
-                                                   std::move(fmt), std::move(prompt));
+                                                   std::move(fmt), std::move(set_prompt),
+                                                   std::move(prompt));
 }
 
 }  // namespace pulp::examples::accompanist
