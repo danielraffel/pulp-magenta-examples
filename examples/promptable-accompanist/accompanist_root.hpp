@@ -68,10 +68,18 @@ public:
             const bool ok = success_.load();
             if (manager_) manager_->set_download_progress(active_dl_id_, -1.0f);  // clear the row
             if (ok) {
-                pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
-                if (on_model_changed_) on_model_changed_();
-                force_manager_ = false;
+                // First model downloaded → auto-set as default + open the editor.
+                // Subsequent downloads keep the current default and stay in the manager
+                // (the user picks "Set default" if they want to switch).
+                const bool had_active = !pulp::runtime::read_active_model_id(kMagentaSubsystem).empty();
+                if (!had_active) {
+                    pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
+                    if (on_model_changed_) on_model_changed_();
+                    force_manager_ = false;
+                }
             }
+            // Cancel/failure both KEEP the .part — the row reappears as "Paused" with
+            // Resume + Delete (the user chooses); a retry resumes from where it left off.
             last_pct_ = -1;
             rebuild();  // success → editor; cancel/fail → manager with the row reset
             frame_sub_ = -1;
@@ -127,6 +135,10 @@ private:
             refresh_manager_list();
         };
         mgr->on_cancel = [this](const std::string&) { cancel_.cancel(); };
+        mgr->on_done = [this] {  // return to the editor
+            force_manager_ = false;
+            rebuild();
+        };
         manager_ = mgr.get();
         add_child(std::move(mgr));
         if (downloading_.load()) manager_->set_download_progress(active_dl_id_, progress_.load());
