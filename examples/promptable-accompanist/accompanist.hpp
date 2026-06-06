@@ -188,7 +188,9 @@ public:
 #else
     // ── GPU-native editor (Track B) — the default. Skia-drawn widgets to Magenta's
     //    tokens; renders in every host AND is headlessly capturable. ──
-    format::ViewSize view_size() const override { return {560, 360, 460, 300, 1000, 720}; }
+    // Tall enough that the host Settings panel's Audio tab fits without scrolling (scrolling
+    // detaches ComboBox dropdowns). The editor (faders) top-aligns in the extra space.
+    format::ViewSize view_size() const override { return {560, 500, 460, 460, 1000, 820}; }
 
     std::unique_ptr<view::View> create_view() override {
         // Just the instrument editor (faders + prompt) or a "you need a model" gate.

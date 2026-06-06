@@ -8,6 +8,7 @@
 
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
+#include <pulp/view/buttons.hpp>       // TextButton — momentary Settings button
 #include <pulp/view/ui_components.hpp>  // TabPanel — to switch to the host's Settings tab
 #include <pulp/canvas/canvas.hpp>
 
@@ -52,11 +53,10 @@ private:
     }
 
     std::unique_ptr<pulp::view::View> make_settings_button(const std::string& label) {
-        auto b = std::make_unique<pulp::view::ToggleButton>();
-        b->set_label(label);
+        auto b = std::make_unique<pulp::view::TextButton>(label);  // momentary, proper hover/press
         b->flex().preferred_width = 112.0f;
         b->flex().preferred_height = 28.0f;
-        b->on_toggle = [this](bool) { open_host_settings(); };
+        b->on_click = [this] { open_host_settings(); };
         return b;
     }
 
@@ -75,9 +75,13 @@ private:
 
     void show_editor() {
         // Top bar: a right-aligned gear that opens the host Settings (Audio/MIDI/Models).
+        // Height/padding MUST match the SettingsPanel's Done header so the top-right button
+        // stays in a fixed position when switching between the editor and Settings.
         auto bar = std::make_unique<pulp::view::View>();
         bar->flex().direction = pulp::view::FlexDirection::row;
-        bar->flex().padding = 10.0f;
+        bar->flex().padding = 12.0f;
+        bar->flex().preferred_height = 52.0f;
+        bar->flex().flex_shrink = 0.0f;
         bar->flex().align_items = pulp::view::FlexAlign::center;
         auto spacer = std::make_unique<pulp::view::View>();
         spacer->flex().flex_grow = 1.0f;
