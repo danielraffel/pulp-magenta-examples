@@ -33,7 +33,7 @@
 #ifdef ACCOMPANIST_WEBVIEW_UI
 #include "accompanist_ui.hpp"
 #else
-#include "accompanist_native_ui.hpp"  // GPU-native editor (Track B) — the default
+#include "accompanist_root.hpp"  // PR4 gated root (manager-or-editor); pulls in native UI
 #endif
 
 #include <atomic>
@@ -190,7 +190,11 @@ public:
     format::ViewSize view_size() const override { return {560, 360, 460, 300, 1000, 720}; }
 
     std::unique_ptr<view::View> create_view() override {
-        return make_accompanist_native_view(
+        // PR4: gate on model availability. If no Magenta model is installed in the
+        // shared store, the root shows the ModelManagerView (download mrt2_small /
+        // mrt2_base) instead of a silent editor; once one is active it shows the
+        // native editor + an active-model indicator.
+        return magenta_demo::make_accompanist_root(
             [this](std::uint32_t id, float v) { state().set_normalized(id, v); },
             [this](std::uint32_t id) { return state().get_normalized(id); },
             [this](std::uint32_t id) -> std::string {
@@ -202,6 +206,7 @@ public:
                 return buf;
             },
             [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); },
+            [this] { /* model changed — engine reload hook (no-op for now) */ },
             env_or("MRT2_PROMPT", "warm analog pads"));
     }
 #endif
