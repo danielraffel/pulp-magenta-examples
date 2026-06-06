@@ -165,7 +165,15 @@ private:
         bar->add_child(std::move(indicator));
         add_child(std::move(bar));
 
-        add_child(acc::make_accompanist_native_view(set_p_, get_p_, fmt_, set_prompt_, prompt_));
+        // Persist the typed prompt across view swaps: remember it here as the user types
+        // (and forward to the engine), and seed the recreated editor with prompt_ — so going
+        // into the model picker and back doesn't reset the field to the default.
+        auto set_prompt_persist = [this](const std::string& p) {
+            prompt_ = p;
+            if (set_prompt_) set_prompt_(p);
+        };
+        add_child(acc::make_accompanist_native_view(set_p_, get_p_, fmt_,
+                                                    std::move(set_prompt_persist), prompt_));
     }
 
     void start_download(const std::string& id) {
