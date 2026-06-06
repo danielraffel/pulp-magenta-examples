@@ -120,7 +120,6 @@ private:
 
     void show_manager() {
         auto mgr = std::make_unique<pulp::view::ModelManagerView>();
-        mgr->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
         mgr->on_download = [this](const std::string& id) { start_download(id); };
         mgr->on_activate = [this](const std::string& id) {
             pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, id);
@@ -140,6 +139,9 @@ private:
             rebuild();
         };
         manager_ = mgr.get();
+        // Set models + close-ability AFTER the callbacks so the first build sees on_done.
+        mgr->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
+        mgr->set_can_close(model_ready());  // a model is installed → Done returns to the editor
         add_child(std::move(mgr));
         if (downloading_.load()) manager_->set_download_progress(active_dl_id_, progress_.load());
     }
