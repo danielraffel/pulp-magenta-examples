@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
     }
     app.set_config(config);
 
-    if (!app.run_with_editor(/*use_gpu=*/false)) {
+    if (!app.run_with_editor(/*use_gpu=*/true)) {
         pulp::runtime::log_error("Failed to run standalone editor");
         return 1;
     }
