@@ -75,7 +75,7 @@ public:
                 if (!had_active) {
                     pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
                     if (on_model_changed_) on_model_changed_();
-                    force_manager_ = false;
+                    show_settings_ = false;  // first model ready → leave Settings for the editor
                 }
             }
             // Cancel/failure both KEEP the .part — the row reappears as "Paused" with
@@ -112,26 +112,36 @@ private:
             native_ui_held_ = remove_child(native_ui_ptr_);
             native_ui_ptr_ = nullptr;
         }
-        clear_children_all();  // removes the indicator bar and/or the manager
+        clear_children_all();  // removes the chrome and/or the settings
         manager_ = nullptr;
-        if (model_ready() && !force_manager_)
+        if (show_settings_)
+            show_settings();
+        else if (model_ready())
             show_editor();
         else
-            show_manager();
+            show_need_model();
     }
+
+    void open_settings(int tab) { settings_tab_ = tab; show_settings_ = true; rebuild(); }
+    void close_settings() { show_settings_ = false; rebuild(); }
 
     void refresh_manager_list() {
         if (manager_) manager_->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
     }
 
-    void show_manager() {
+    using V = pulp::view::View;
+    using TB = pulp::view::ToggleButton;
+    using Lbl = pulp::view::Label;
+    static pulp::canvas::Color col(int r, int g, int b) { return pulp::canvas::Color::rgba8(r, g, b, 255); }
+
+    // The Models settings section. No Done — the Settings header's Close handles exit.
+    std::unique_ptr<pulp::view::ModelManagerView> build_models_view() {
         auto mgr = std::make_unique<pulp::view::ModelManagerView>();
         mgr->on_download = [this](const std::string& id) { start_download(id); };
         mgr->on_activate = [this](const std::string& id) {
             pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, id);
             if (on_model_changed_) on_model_changed_();
-            force_manager_ = false;
-            rebuild();
+            refresh_manager_list();  // stay in Settings
         };
         mgr->on_remove = [this](const std::string& id) {
             std::string err;
@@ -140,39 +150,108 @@ private:
             refresh_manager_list();
         };
         mgr->on_cancel = [this](const std::string&) { cancel_.cancel(); };
-        mgr->on_done = [this] {  // return to the editor
-            force_manager_ = false;
-            rebuild();
-        };
         manager_ = mgr.get();
-        // Set models + close-ability AFTER the callbacks so the first build sees on_done.
         mgr->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
-        mgr->set_can_close(model_ready());  // a model is installed → Done returns to the editor
-        add_child(std::move(mgr));
-        if (downloading_.load()) manager_->set_download_progress(active_dl_id_, progress_.load());
+        mgr->set_can_close(false);  // unified Settings owns the Close
+        if (downloading_.load()) mgr->set_download_progress(active_dl_id_, progress_.load());
+        return mgr;
+    }
+
+    std::unique_ptr<TB> make_tab(const std::string& label, int tab) {
+        auto b = std::make_unique<TB>();
+        b->set_label(label);
+        b->set_on(settings_tab_ == tab);
+        b->flex().preferred_width = 92.0f;
+        b->flex().preferred_height = 28.0f;
+        b->on_toggle = [this, tab](bool) { settings_tab_ = tab; rebuild(); };
+        return b;
+    }
+
+    void show_settings() {
+        // Header: title + Close.
+        auto header = std::make_unique<V>();
+        header->flex().direction = pulp::view::FlexDirection::row;
+        header->flex().align_items = pulp::view::FlexAlign::center;
+        header->flex().padding = 16.0f;
+        header->flex().gap = 10.0f;
+        auto title = std::make_unique<Lbl>("Settings");
+        title->set_font_size(20.0f);
+        title->set_font_weight(700);
+        title->set_text_color(col(235, 235, 240));
+        title->flex().flex_grow = 1.0f;
+        header->add_child(std::move(title));
+        auto close = std::make_unique<TB>();
+        close->set_label("Close");
+        close->flex().preferred_width = 88.0f;
+        close->flex().preferred_height = 28.0f;
+        close->on_toggle = [this](bool) { close_settings(); };
+        header->add_child(std::move(close));
+        add_child(std::move(header));
+
+        // Tab bar.
+        auto tabs = std::make_unique<V>();
+        tabs->flex().direction = pulp::view::FlexDirection::row;
+        tabs->flex().gap = 8.0f;
+        tabs->flex().padding = 8.0f;
+        tabs->add_child(make_tab("Models", 0));
+        tabs->add_child(make_tab("Audio", 1));
+        tabs->add_child(make_tab("MIDI", 2));
+        add_child(std::move(tabs));
+
+        // Content.
+        if (settings_tab_ == 0) {
+            add_child(build_models_view());
+        } else {
+            auto msg = std::make_unique<Lbl>(
+                settings_tab_ == 1 ? "Audio output device / sample rate / buffer — wiring the host"
+                                     " device picker next."
+                                   : "MIDI input device — wiring next.");
+            msg->set_font_size(13.0f);
+            msg->set_text_color(col(170, 170, 175));
+            msg->flex().padding = 20.0f;
+            add_child(std::move(msg));
+        }
+    }
+
+    void show_need_model() {
+        auto wrap = std::make_unique<V>();
+        wrap->flex().direction = pulp::view::FlexDirection::column;
+        wrap->flex().flex_grow = 1.0f;
+        wrap->flex().align_items = pulp::view::FlexAlign::center;
+        wrap->flex().gap = 14.0f;
+        wrap->flex().padding = 60.0f;
+        auto msg = std::make_unique<Lbl>("You need to download a model to start generating.");
+        msg->set_font_size(15.0f);
+        msg->set_text_color(col(220, 220, 225));
+        wrap->add_child(std::move(msg));
+        auto btn = std::make_unique<TB>();
+        btn->set_label("Download a model");
+        btn->flex().preferred_width = 180.0f;
+        btn->flex().preferred_height = 34.0f;
+        btn->on_toggle = [this](bool) { open_settings(0); };
+        wrap->add_child(std::move(btn));
+        add_child(std::move(wrap));
     }
 
     void show_editor() {
-        // Active-model indicator (outside the manager) — tap to reopen the manager.
-        auto bar = std::make_unique<pulp::view::View>();
+        // Top bar: a gear that opens Settings (no model indicator).
+        auto bar = std::make_unique<V>();
         bar->flex().direction = pulp::view::FlexDirection::row;
-        bar->flex().padding = 12.0f;
-        bar->flex().gap = 8.0f;
+        bar->flex().padding = 10.0f;
         bar->flex().align_items = pulp::view::FlexAlign::center;
-
-        const auto id = pulp::runtime::read_active_model_id(kMagentaSubsystem);
-        auto indicator = std::make_unique<pulp::view::ToggleButton>();
-        indicator->set_label("Model: " + id + "  ▾");  // ▾
-        indicator->flex().preferred_height = 24.0f;
-        indicator->on_toggle = [this](bool) {
-            force_manager_ = true;
-            rebuild();
-        };
-        bar->add_child(std::move(indicator));
+        auto spacer = std::make_unique<V>();
+        spacer->flex().flex_grow = 1.0f;
+        bar->add_child(std::move(spacer));
+        auto gear = std::make_unique<TB>();
+        gear->set_label("⚙ Settings");
+        gear->flex().preferred_width = 112.0f;
+        gear->flex().preferred_height = 26.0f;
+        gear->on_toggle = [this](bool) { open_settings(0); };
+        bar->add_child(std::move(gear));
         add_child(std::move(bar));
 
         // The native editor UI is built ONCE and kept alive across swaps, so the typed
-        // prompt (and any in-field edit state) survives going into the picker and back.
+        // prompt (and any in-field edit state) survives going into Settings and back.
         if (!native_ui_held_) {
             auto set_prompt_persist = [this](const std::string& p) {
                 prompt_ = p;
@@ -229,7 +308,8 @@ private:
     pulp::view::ModelManagerView* manager_ = nullptr;
     std::unique_ptr<pulp::view::View> native_ui_held_;  // editor UI when stashed (not mounted)
     pulp::view::View* native_ui_ptr_ = nullptr;          // editor UI when mounted in the tree
-    bool force_manager_ = false;
+    bool show_settings_ = false;  // Settings overlay open
+    int settings_tab_ = 0;        // 0 = Models, 1 = Audio, 2 = MIDI
 
     std::thread worker_;
     pulp::runtime::CancellationToken cancel_;

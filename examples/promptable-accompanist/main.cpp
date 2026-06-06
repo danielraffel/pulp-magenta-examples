@@ -17,8 +17,8 @@ int main(int argc, char** argv) {
     config.buffer_size = 512;
     config.input_channels = 0;      // instrument: no audio input
     config.output_channels = 2;
-    config.show_settings_tab = true;  // built-in audio/MIDI settings: output device picker,
-                                      // sample rate, buffer size, test signal (AudioDeviceManager)
+    config.show_settings_tab = false;  // E1 owns a unified Settings (gear → Models/Audio/MIDI);
+                                       // avoids a second host-provided Settings tab.
 
     // --screenshot=PATH → headless capture of the first painted editor frame.
     for (int i = 1; i < argc; ++i) {
