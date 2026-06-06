@@ -8,6 +8,7 @@
 
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
+#include <pulp/view/ui_components.hpp>  // TabPanel — to switch to the host's Settings tab
 #include <pulp/canvas/canvas.hpp>
 
 #include "accompanist_native_ui.hpp"
@@ -40,6 +41,25 @@ public:
     void refresh() { rebuild(); }
 
 private:
+    // The editor is the host TabPanel's "Editor" tab content — walk up to the TabPanel and
+    // switch to "Settings" (index 1). Reliable access regardless of the tab-bar chrome.
+    void open_host_settings() {
+        for (pulp::view::View* v = parent(); v != nullptr; v = v->parent())
+            if (auto* tabs = dynamic_cast<pulp::view::TabPanel*>(v)) {
+                tabs->set_active_tab(1);
+                return;
+            }
+    }
+
+    std::unique_ptr<pulp::view::View> make_settings_button(const std::string& label) {
+        auto b = std::make_unique<pulp::view::ToggleButton>();
+        b->set_label(label);
+        b->flex().preferred_width = 112.0f;
+        b->flex().preferred_height = 28.0f;
+        b->on_toggle = [this](bool) { open_host_settings(); };
+        return b;
+    }
+
     void rebuild() {
         // Preserve the native UI (and its typed prompt) across swaps — stash, don't destroy.
         if (native_ui_ptr_) {
@@ -54,6 +74,17 @@ private:
     }
 
     void show_editor() {
+        // Top bar: a right-aligned gear that opens the host Settings (Audio/MIDI/Models).
+        auto bar = std::make_unique<pulp::view::View>();
+        bar->flex().direction = pulp::view::FlexDirection::row;
+        bar->flex().padding = 10.0f;
+        bar->flex().align_items = pulp::view::FlexAlign::center;
+        auto spacer = std::make_unique<pulp::view::View>();
+        spacer->flex().flex_grow = 1.0f;
+        bar->add_child(std::move(spacer));
+        bar->add_child(make_settings_button("\xE2\x9A\x99 Settings"));  // gear
+        add_child(std::move(bar));
+
         if (!native_ui_held_) {
             auto set_prompt_persist = [this](const std::string& p) {
                 prompt_ = p;
@@ -80,11 +111,12 @@ private:
         wrap->add_child(std::move(title));
 
         auto hint = std::make_unique<pulp::view::Label>(
-            "Open the Settings tab → Models and download mrt2_small or mrt2_base.");
+            "Download mrt2_small or mrt2_base in Settings → Models.");
         hint->set_font_size(13.0f);
         hint->set_text_color(pulp::canvas::Color::rgba8(165, 165, 170, 255));
         wrap->add_child(std::move(hint));
 
+        wrap->add_child(make_settings_button("Open Settings"));
         add_child(std::move(wrap));
     }
 
