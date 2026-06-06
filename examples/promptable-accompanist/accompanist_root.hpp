@@ -11,6 +11,7 @@
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
 #include <pulp/view/model_manager_view.hpp>
+#include <pulp/view/frame_clock.hpp>
 #include <pulp/runtime/model_store.hpp>
 #include <pulp/runtime/model_download.hpp>
 #include <pulp/runtime/async_stream.hpp>
@@ -47,24 +48,42 @@ public:
     }
 
     ~AccompanistRoot() override {
+        if (frame_sub_ >= 0)
+            if (auto* fc = frame_clock()) fc->unsubscribe(frame_sub_);
         cancel_.cancel();
         if (worker_.joinable()) worker_.detach();
     }
 
-    /// Called by the Processor on its UI timer: applies download progress + completion.
-    void poll() {
-        if (!downloading_.load(std::memory_order_acquire)) return;
-        if (manager_) manager_->set_download_progress(active_dl_id_, progress_.load());
+    /// Frame-clock tick (UI thread — safe to mutate the view tree): applies download
+    /// progress + completion/cancel. Returns true to keep receiving ticks (while a
+    /// download is in flight); false auto-unsubscribes when nothing is downloading.
+    bool tick(float /*dt*/) {
+        if (!downloading_.load(std::memory_order_acquire)) {
+            frame_sub_ = -1;
+            return false;
+        }
         if (done_.load(std::memory_order_acquire)) {
             downloading_.store(false, std::memory_order_release);
             if (worker_.joinable()) worker_.join();
-            if (success_.load()) {
+            const bool ok = success_.load();
+            if (manager_) manager_->set_download_progress(active_dl_id_, -1.0f);  // clear the row
+            if (ok) {
                 pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
                 if (on_model_changed_) on_model_changed_();
                 force_manager_ = false;
             }
-            rebuild();
+            last_pct_ = -1;
+            rebuild();  // success → editor; cancel/fail → manager with the row reset
+            frame_sub_ = -1;
+            return false;
         }
+        // Throttle: only rebuild the row when the integer percent changes.
+        const int pct = static_cast<int>(progress_.load() * 100.0f + 0.5f);
+        if (pct != last_pct_) {
+            last_pct_ = pct;
+            if (manager_) manager_->set_download_progress(active_dl_id_, progress_.load());
+        }
+        return true;
     }
 
 private:
@@ -161,6 +180,12 @@ private:
             success_.store(res.ok, std::memory_order_release);
             done_.store(true, std::memory_order_release);
         });
+
+        // Drive progress/completion from the UI-thread frame clock (keeps the host's
+        // 60 Hz animation timer alive while a download is in flight).
+        last_pct_ = -1;
+        if (auto* fc = frame_clock(); fc && frame_sub_ < 0)
+            frame_sub_ = fc->subscribe([this](float dt) { return tick(dt); });
     }
 
     acc::SetParamNorm set_p_;
@@ -180,6 +205,8 @@ private:
     std::atomic<bool> success_{false};
     std::atomic<float> progress_{0.0f};
     std::string active_dl_id_;
+    int frame_sub_ = -1;  // FrameClock subscription id while downloading
+    int last_pct_ = -1;   // throttle row rebuilds to integer-percent changes
 };
 
 inline std::unique_ptr<pulp::view::View> make_accompanist_root(
