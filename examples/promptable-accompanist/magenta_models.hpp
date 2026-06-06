@@ -18,6 +18,8 @@
 
 namespace magenta_demo {
 
+inline constexpr char kMagentaSubsystem[] = "magenta";
+
 inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
     using pulp::runtime::ModelAsset;
     using pulp::runtime::ModelEntry;

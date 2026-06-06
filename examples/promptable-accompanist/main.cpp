@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     config.buffer_size = 512;
     config.input_channels = 0;      // instrument: no audio input
     config.output_channels = 2;
-    config.show_settings_tab = false;  // E1 owns a unified Settings (gear → Models/Audio/MIDI);
+    config.show_settings_tab = true;   // host Settings: [Audio][MIDI] + the plugin's Models tab
                                        // avoids a second host-provided Settings tab.
 
     // --screenshot=PATH → headless capture of the first painted editor frame.

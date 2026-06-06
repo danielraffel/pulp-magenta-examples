@@ -33,7 +33,8 @@
 #ifdef ACCOMPANIST_WEBVIEW_UI
 #include "accompanist_ui.hpp"
 #else
-#include "accompanist_root.hpp"  // PR4 gated root (manager-or-editor); pulls in native UI
+#include "accompanist_root.hpp"  // the instrument editor (faders + prompt) + "need a model" gate
+#include "model_section.hpp"     // the Models tab E1 contributes to the host Settings
 #endif
 
 #include <atomic>
@@ -190,11 +191,11 @@ public:
     format::ViewSize view_size() const override { return {560, 360, 460, 300, 1000, 720}; }
 
     std::unique_ptr<view::View> create_view() override {
-        // PR4: gate on model availability. If no Magenta model is installed in the
-        // shared store, the root shows the ModelManagerView (download mrt2_small /
-        // mrt2_base) instead of a silent editor; once one is active it shows the
-        // native editor + an active-model indicator.
-        return magenta_demo::make_accompanist_root(
+        // Just the instrument editor (faders + prompt) or a "you need a model" gate.
+        // Model management + audio/MIDI device settings live in the host's unified Settings
+        // panel — Models is contributed via settings_sections() below; Audio/MIDI are the
+        // host's own tabs (the host owns the audio device).
+        auto editor = std::make_unique<magenta_demo::AccompanistRoot>(
             [this](std::uint32_t id, float v) { state().set_normalized(id, v); },
             [this](std::uint32_t id) { return state().get_normalized(id); },
             [this](std::uint32_t id) -> std::string {
@@ -206,8 +207,21 @@ public:
                 return buf;
             },
             [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); },
-            [this] { /* model changed — engine reload hook (no-op for now) */ },
+            [] { std::error_code ec; return std::filesystem::exists(default_model(), ec); },  // model_ready
             env_or("MRT2_PROMPT", "warm analog pads"));
+        editor_ = editor.get();
+        return editor;
+    }
+
+    void on_view_closed(view::View&) override { editor_ = nullptr; }
+
+    // E1 contributes a "Models" tab to the host's unified Settings panel; the host composes
+    // it alongside its own Audio/MIDI device tabs (Processor::settings_sections, MM-PR5).
+    std::vector<format::Processor::SettingsSection> settings_sections() override {
+        std::vector<format::Processor::SettingsSection> sections;
+        sections.push_back({"Models", std::make_unique<magenta_demo::ModelSection>(
+                                          [this] { if (editor_) editor_->refresh(); })});
+        return sections;
     }
 #endif
 
@@ -258,6 +272,7 @@ private:
     std::thread worker_;
     std::atomic<bool> worker_started_{false};
     double sample_rate_ = 48000.0;
+    magenta_demo::AccompanistRoot* editor_ = nullptr;  // refreshed when the active model changes
 };
 
 inline std::unique_ptr<format::Processor> create_promptable_accompanist() {
