@@ -60,9 +60,21 @@ inline std::string default_resources() {
     return env_or("MRT2_RESOURCES", (std::filesystem::path(env_or("HOME", "")) /
                   "Documents/Magenta/magenta-rt-v2/resources").string());
 }
+// Resolve the model file. Explicit MRT2_MODEL wins; otherwise PREFER the large
+// model (mrt2_base, 2.4B — better quality, needs a Pro/Max Mac) when it's been
+// downloaded, and fall back to mrt2_small (230M, any M-series). Weights are NOT
+// bundled in the plugin (GB-scale, CC-BY-4.0 Google DeepMind) — the user installs
+// them once to this shared path via scripts/install-weights.sh, and every Pulp
+// Magenta plugin/app finds them here.
 inline std::string default_model() {
-    return env_or("MRT2_MODEL", (std::filesystem::path(env_or("HOME", "")) /
-                  "Documents/Magenta/magenta-rt-v2/models/mrt2_small/mrt2_small.mlxfn").string());
+    if (const char* e = std::getenv("MRT2_MODEL"); e && *e) return e;
+    const auto root = std::filesystem::path(env_or("HOME", "")) /
+                      "Documents/Magenta/magenta-rt-v2/models";
+    const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";   // large, preferred
+    const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";  // fallback
+    std::error_code ec;
+    if (std::filesystem::exists(base, ec)) return base.string();
+    return small.string();
 }
 
 // Heap engine state shared between the Processor and its worker thread, so the
@@ -200,6 +212,17 @@ private:
         namespace mc = magentart::core;
         {
             magentart::detail::AutoreleasePool pool;
+            std::error_code ec;
+            if (!std::filesystem::exists(default_model(), ec)) {
+                std::fprintf(stderr,
+                    "[PromptableAccompanist] MRT2 model not found at:\n    %s\n"
+                    "  Install the weights once (downloaded to ~/Documents/Magenta/magenta-rt-v2):\n"
+                    "    scripts/install-weights.sh mrt2_base     # large, 2.4B (Pro/Max)\n"
+                    "    scripts/install-weights.sh mrt2_small    # 230M (any M-series)\n"
+                    "  Or set MRT2_MODEL to a .mlxfn path. Weights are CC-BY-4.0 (Google DeepMind),\n"
+                    "  not bundled in the plugin. The instrument stays silent until a model loads.\n",
+                    default_model().c_str());
+            }
             if (!st->engine.init_assets(default_resources().c_str(), "musiccoca") ||
                 !st->engine.load_model(default_model().c_str())) {
                 st->load_failed.store(true);
