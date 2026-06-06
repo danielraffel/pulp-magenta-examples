@@ -106,7 +106,13 @@ private:
     }
 
     void rebuild() {
-        clear_children_all();
+        // Preserve the editor's native UI (and its TextEditor's typed text) across swaps:
+        // stash it out of the tree rather than destroying + recreating it.
+        if (native_ui_ptr_) {
+            native_ui_held_ = remove_child(native_ui_ptr_);
+            native_ui_ptr_ = nullptr;
+        }
+        clear_children_all();  // removes the indicator bar and/or the manager
         manager_ = nullptr;
         if (model_ready() && !force_manager_)
             show_editor();
@@ -165,15 +171,18 @@ private:
         bar->add_child(std::move(indicator));
         add_child(std::move(bar));
 
-        // Persist the typed prompt across view swaps: remember it here as the user types
-        // (and forward to the engine), and seed the recreated editor with prompt_ — so going
-        // into the model picker and back doesn't reset the field to the default.
-        auto set_prompt_persist = [this](const std::string& p) {
-            prompt_ = p;
-            if (set_prompt_) set_prompt_(p);
-        };
-        add_child(acc::make_accompanist_native_view(set_p_, get_p_, fmt_,
-                                                    std::move(set_prompt_persist), prompt_));
+        // The native editor UI is built ONCE and kept alive across swaps, so the typed
+        // prompt (and any in-field edit state) survives going into the picker and back.
+        if (!native_ui_held_) {
+            auto set_prompt_persist = [this](const std::string& p) {
+                prompt_ = p;
+                if (set_prompt_) set_prompt_(p);
+            };
+            native_ui_held_ = acc::make_accompanist_native_view(set_p_, get_p_, fmt_,
+                                                                std::move(set_prompt_persist), prompt_);
+        }
+        native_ui_ptr_ = native_ui_held_.get();
+        add_child(std::move(native_ui_held_));
     }
 
     void start_download(const std::string& id) {
@@ -218,6 +227,8 @@ private:
     std::string prompt_;
 
     pulp::view::ModelManagerView* manager_ = nullptr;
+    std::unique_ptr<pulp::view::View> native_ui_held_;  // editor UI when stashed (not mounted)
+    pulp::view::View* native_ui_ptr_ = nullptr;          // editor UI when mounted in the tree
     bool force_manager_ = false;
 
     std::thread worker_;
