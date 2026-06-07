@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -112,6 +113,27 @@ struct EngineState {
     magentart::core::MLXEngine engine;
     magentart::core::RingBuffer ring_l, ring_r;
     std::atomic<bool> running{true}, loaded{false}, load_failed{false};
+
+    // Live model hot-reload. MLX makes streams/encoders thread_local, so the
+    // model swap MUST run on the worker thread, not in the UI callback that asks
+    // for it. The UI publishes the new checkpoint path + raises a flag; the worker
+    // services it at a frame boundary (see worker_run). The prompt is mirrored
+    // here so it survives a reload (a fresh load_model resets the engine prompt).
+    std::atomic<bool> reload_requested{false};
+    std::mutex mutex_;                 // guards pending_model_path + current_prompt
+    std::string pending_model_path;
+    std::string current_prompt;
+
+    void request_reload(std::string checkpoint_path) {
+        { std::lock_guard<std::mutex> lk(mutex_); pending_model_path = std::move(checkpoint_path); }
+        reload_requested.store(true, std::memory_order_release);
+    }
+    // Set the text prompt on the engine (safe from any thread — the engine defers
+    // the MLX text-encode to its worker) and remember it for the next reload.
+    void set_prompt(const std::string& p) {
+        { std::lock_guard<std::mutex> lk(mutex_); current_prompt = p; }
+        engine.set_text_prompt(p);
+    }
 };
 
 class Processor : public format::Processor {
@@ -149,6 +171,7 @@ public:
         sample_rate_ = ctx.sample_rate;
         if (!worker_started_.exchange(true)) {
             st_ = std::make_shared<EngineState>();
+            st_->current_prompt = env_or("MRT2_PROMPT", "warm analog pads");  // before worker loads
             st_->ring_l.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
             st_->ring_r.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
             auto st = st_;                                 // worker holds a ref
@@ -198,7 +221,7 @@ public:
     std::unique_ptr<view::View> create_view() override {
         return std::make_unique<AccompanistRoot>(
             [this](std::uint32_t id, float v) { state().set_value(id, v); },
-            [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); });
+            [this](const std::string& p) { if (st_) st_->set_prompt(p); });
     }
     void on_view_opened(view::View& root) override {
         static_cast<AccompanistRoot&>(root).pane().attach_if_needed();
@@ -232,14 +255,13 @@ public:
                 else                         std::snprintf(buf, sizeof buf, "%.1f", v);
                 return buf;
             },
-            [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); },
+            [this](const std::string& p) { if (st_) st_->set_prompt(p); },
             [] { std::error_code ec; return std::filesystem::exists(default_model(), ec); },  // model_ready
-            // on_model_changed (in-editor Models overlay, DAW). Must NOT rebuild the editor
-            // here — that would destroy the ModelSection mid-callback; the overlay's Done
-            // button refreshes the editor safely. Reloading the running engine from the shared
-            // store is the next slice (engine-store integration); the download itself completes
-            // here and is picked up on the next engine start.
-            [] {},
+            // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
+            // the newly-activated model from the shared store — it swaps live, no restart. We
+            // must NOT rebuild the editor here (that would destroy the ModelSection mid-callback);
+            // the overlay's Done button refreshes the editor safely.
+            [this] { if (st_) st_->request_reload(default_model()); },
             env_or("MRT2_PROMPT", "warm analog pads"));
         editor_ = editor.get();
         return editor;
@@ -252,44 +274,81 @@ public:
     std::vector<format::Processor::SettingsSection> settings_sections() override {
         std::vector<format::Processor::SettingsSection> sections;
         sections.push_back({"Models", std::make_unique<magenta_demo::ModelSection>(
-                                          [this] { if (editor_) editor_->refresh(); })});
+                                          [this] {
+                                              if (st_) st_->request_reload(default_model());  // swap live
+                                              if (editor_) editor_->refresh();
+                                          })});
         return sections;
     }
 #endif
 
 private:
-    static void worker_run(std::shared_ptr<EngineState> st) {
+    // Load a checkpoint on THIS (worker) thread — required: MLX streams/encoders
+    // are thread_local, so load_model must run where generate_frame runs. Returns
+    // true once the model + its text/quantizer encoders are ready. Re-applies the
+    // remembered prompt so a hot-reload doesn't drop it. assets_ok gates the very
+    // first init_assets (resources are shared and loaded once).
+    static bool worker_load(const std::shared_ptr<EngineState>& st, const std::string& path,
+                            bool assets_ok) {
         using namespace std::chrono_literals;
-        namespace mc = magentart::core;
-        {
-            magentart::detail::AutoreleasePool pool;
-            std::error_code ec;
-            if (!std::filesystem::exists(default_model(), ec)) {
-                std::fprintf(stderr,
-                    "[PromptableAccompanist] MRT2 model not found at:\n    %s\n"
-                    "  Install the weights once (downloaded to ~/Documents/Magenta/magenta-rt-v2):\n"
-                    "    scripts/install-weights.sh mrt2_base     # large, 2.4B (Pro/Max)\n"
-                    "    scripts/install-weights.sh mrt2_small    # 230M (any M-series)\n"
-                    "  Or set MRT2_MODEL to a .mlxfn path. Weights are CC-BY-4.0 (Google DeepMind),\n"
-                    "  not bundled in the plugin. The instrument stays silent until a model loads.\n",
-                    default_model().c_str());
-            }
-            if (!st->engine.init_assets(default_resources().c_str(), "musiccoca") ||
-                !st->engine.load_model(default_model().c_str())) {
-                st->load_failed.store(true);
-                return;
-            }
-            st->engine.set_text_prompt(env_or("MRT2_PROMPT", "warm analog pads"));
-        }
+        magentart::detail::AutoreleasePool pool;
+        std::error_code ec;
+        if (!assets_ok || path.empty() || !std::filesystem::exists(path, ec)) return false;
+        if (st->engine.is_loaded()) st->engine.unload();   // swap: drop the old model first
+        if (!st->engine.load_model(path.c_str())) return false;
+        std::string prompt;
+        { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
+        st->engine.set_text_prompt(prompt);
         while (st->running.load() &&
                (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
             std::this_thread::sleep_for(10ms);
-        st->loaded.store(true);
+        return true;
+    }
+
+    static void worker_run(std::shared_ptr<EngineState> st) {
+        using namespace std::chrono_literals;
+        namespace mc = magentart::core;
+
+        bool assets_ok = false;
+        {
+            magentart::detail::AutoreleasePool pool;
+            assets_ok = st->engine.init_assets(default_resources().c_str(), "musiccoca");
+        }
+        if (!assets_ok)
+            std::fprintf(stderr, "[PromptableAccompanist] MRT2 shared resources not found at:\n"
+                                 "    %s\n  The instrument stays silent until they are installed.\n",
+                         default_resources().c_str());
+
+        // Initial load. Unlike before, a missing model is NOT fatal — the worker idles
+        // and keeps servicing reload requests, so a model downloaded later from the
+        // in-plugin Models overlay starts playing live, with no restart.
+        const std::string initial = default_model();
+        std::error_code ec;
+        if (assets_ok && !std::filesystem::exists(initial, ec))
+            std::fprintf(stderr,
+                "[PromptableAccompanist] No MRT2 model installed yet. Open Settings -> Models to\n"
+                "  download one (mrt2_small or mrt2_base) — it will start playing without a restart.\n");
+        bool ok = worker_load(st, initial, assets_ok);
+        st->loaded.store(ok);
+        st->load_failed.store(!ok);
 
         float L[mc::kFrameSamples], R[mc::kFrameSamples];
         const std::size_t headroom = mc::RingBuffer::kCapacity - 2 * mc::kFrameSamples;
         while (st->running.load()) {
-            if (st->ring_l.available() > headroom) {        // ring nearly full → wait
+            // Service a hot-reload at a frame boundary (on this MLX-owning thread).
+            if (st->reload_requested.exchange(false, std::memory_order_acquire)) {
+                std::string path;
+                { std::lock_guard<std::mutex> lk(st->mutex_); path = st->pending_model_path; }
+                st->loaded.store(false);
+                const bool rok = worker_load(st, path, assets_ok);
+                st->loaded.store(rok);
+                st->load_failed.store(!rok);
+            }
+            if (!st->loaded.load()) {               // no model yet → idle, stay responsive
+                std::this_thread::sleep_for(20ms);
+                continue;
+            }
+            if (st->ring_l.available() > headroom) {  // ring nearly full → wait
                 std::this_thread::sleep_for(2ms);
                 continue;
             }
