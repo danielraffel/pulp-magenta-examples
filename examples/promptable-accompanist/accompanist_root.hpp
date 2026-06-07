@@ -1,18 +1,22 @@
 #pragma once
 
-// AccompanistRoot — E1's editor view. Just the instrument UI now: the native faders +
-// prompt when a model is available, or a "you need a model" gate pointing at the host's
-// Settings → Models tab when not. Model management + audio/MIDI device settings live in
-// the host's unified Settings panel (Processor::settings_sections + the host SettingsPanel)
-// — this view owns neither. The Processor calls refresh() when the active model changes.
+// AccompanistRoot — E1's editor view. The native faders + prompt when a model is available,
+// or a "you need a model" gate when not. A gear button reaches model management:
+//   • Standalone: switches the host's card-stack chrome to its unified Settings tab
+//     (Audio/MIDI device pickers + the plugin's Models tab).
+//   • In a DAW (no host chrome): opens an in-EDITOR Models overlay so a plugin-only install
+//     can still download a model — the host owns audio/MIDI, but model download is the
+//     plugin's job. The model is shared (~/.pulp/<subsystem>), so it's downloaded once.
+// The Processor calls refresh() when the active model changes.
 
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
-#include <pulp/view/buttons.hpp>       // TextButton — momentary Settings button
-#include <pulp/view/ui_components.hpp>  // TabPanel — to switch to the host's Settings tab
+#include <pulp/view/buttons.hpp>       // TextButton — momentary gear / Done buttons
+#include <pulp/view/ui_components.hpp>  // TabPanel — host Settings switch (standalone)
 #include <pulp/canvas/canvas.hpp>
 
 #include "accompanist_native_ui.hpp"
+#include "model_section.hpp"  // the in-editor Models overlay (DAW)
 
 #include <functional>
 #include <memory>
@@ -25,58 +29,50 @@ namespace acc = pulp::examples::accompanist;
 class AccompanistRoot : public pulp::view::View {
 public:
     AccompanistRoot(acc::SetParamNorm set_p, acc::GetParamNorm get_p, acc::FmtParam fmt,
-                    acc::SetPrompt set_prompt, std::function<bool()> model_ready, std::string prompt)
+                    acc::SetPrompt set_prompt, std::function<bool()> model_ready,
+                    std::function<void()> on_model_changed, std::string prompt)
         : set_p_(std::move(set_p)),
           get_p_(std::move(get_p)),
           fmt_(std::move(fmt)),
           set_prompt_(std::move(set_prompt)),
           model_ready_(std::move(model_ready)),
+          on_model_changed_(std::move(on_model_changed)),
           prompt_(std::move(prompt)) {
         flex().direction = pulp::view::FlexDirection::column;
         flex().flex_grow = 1.0f;
         rebuild();
     }
 
-    /// Called by the Processor when the active model changes (downloaded / removed in the
-    /// host Settings → Models tab) so the editor swaps between the gate and the instrument.
+    /// Called by the Processor when the active model changes so the editor swaps between the
+    /// gate and the instrument.
     void refresh() { rebuild(); }
 
 private:
-    // The editor is the host TabPanel's "Editor" tab content — walk up to the TabPanel and
-    // switch to "Settings" (index 1). Reliable access regardless of the tab-bar chrome.
-    void open_host_settings() {
+    // Reach model management. In the standalone the editor lives inside a host card-stack
+    // TabPanel (tab 1 = the unified Settings); switch to it. In a DAW there's no such
+    // ancestor, so fall back to an in-editor Models overlay.
+    void open_settings() {
         for (pulp::view::View* v = parent(); v != nullptr; v = v->parent())
             if (auto* tabs = dynamic_cast<pulp::view::TabPanel*>(v)) {
                 tabs->set_active_tab(1);
                 return;
             }
+        show_models_ = true;  // DAW: no host chrome — show Models inside the plugin
+        rebuild();
     }
 
-    std::unique_ptr<pulp::view::View> make_settings_button(const std::string& label) {
-        auto b = std::make_unique<pulp::view::TextButton>(label);  // momentary, proper hover/press
+    std::unique_ptr<pulp::view::View> make_text_button(const std::string& label,
+                                                       std::function<void()> on_click) {
+        auto b = std::make_unique<pulp::view::TextButton>(label);
         b->flex().preferred_width = 112.0f;
         b->flex().preferred_height = 28.0f;
-        b->on_click = [this] { open_host_settings(); };
+        b->on_click = std::move(on_click);
         return b;
     }
 
-    void rebuild() {
-        // Preserve the native UI (and its typed prompt) across swaps — stash, don't destroy.
-        if (native_ui_ptr_) {
-            native_ui_held_ = remove_child(native_ui_ptr_);
-            native_ui_ptr_ = nullptr;
-        }
-        while (child_count() > 0) remove_child(child_at(0));
-        if (model_ready_ && model_ready_())
-            show_editor();
-        else
-            show_need_model();
-    }
-
-    void show_editor() {
-        // Top bar: a right-aligned gear that opens the host Settings (Audio/MIDI/Models).
-        // Height/padding MUST match the SettingsPanel's Done header so the top-right button
-        // stays in a fixed position when switching between the editor and Settings.
+    // A fixed-height top bar with a single right-aligned button (gear or Done). Keeping the
+    // height/padding identical means the button never jumps when views swap.
+    std::unique_ptr<pulp::view::View> make_top_bar(std::unique_ptr<pulp::view::View> button) {
         auto bar = std::make_unique<pulp::view::View>();
         bar->flex().direction = pulp::view::FlexDirection::row;
         bar->flex().padding = 12.0f;
@@ -86,8 +82,28 @@ private:
         auto spacer = std::make_unique<pulp::view::View>();
         spacer->flex().flex_grow = 1.0f;
         bar->add_child(std::move(spacer));
-        bar->add_child(make_settings_button("\xE2\x9A\x99 Settings"));  // gear
-        add_child(std::move(bar));
+        bar->add_child(std::move(button));
+        return bar;
+    }
+
+    void rebuild() {
+        // Preserve the native UI (and its typed prompt) across swaps — stash, don't destroy.
+        if (native_ui_ptr_) {
+            native_ui_held_ = remove_child(native_ui_ptr_);
+            native_ui_ptr_ = nullptr;
+        }
+        while (child_count() > 0) remove_child(child_at(0));
+
+        if (show_models_)
+            show_models_overlay();
+        else if (model_ready_ && model_ready_())
+            show_editor();
+        else
+            show_need_model();
+    }
+
+    void show_editor() {
+        add_child(make_top_bar(make_text_button("\xE2\x9A\x99 Settings", [this] { open_settings(); })));
 
         if (!native_ui_held_) {
             auto set_prompt_persist = [this](const std::string& p) {
@@ -114,14 +130,24 @@ private:
         title->set_text_color(pulp::canvas::Color::rgba8(225, 225, 230, 255));
         wrap->add_child(std::move(title));
 
-        auto hint = std::make_unique<pulp::view::Label>(
-            "Download mrt2_small or mrt2_base in Settings → Models.");
+        auto hint = std::make_unique<pulp::view::Label>("Download mrt2_small or mrt2_base.");
         hint->set_font_size(13.0f);
         hint->set_text_color(pulp::canvas::Color::rgba8(165, 165, 170, 255));
         wrap->add_child(std::move(hint));
 
-        wrap->add_child(make_settings_button("Open Settings"));
+        wrap->add_child(make_text_button("Download a model", [this] { open_settings(); }));
         add_child(std::move(wrap));
+    }
+
+    // In-editor Models overlay (DAW): a Done bar + the shared ModelSection.
+    void show_models_overlay() {
+        add_child(make_top_bar(make_text_button("Done", [this] {
+            show_models_ = false;
+            rebuild();
+        })));
+        add_child(std::make_unique<ModelSection>([this] {
+            if (on_model_changed_) on_model_changed_();  // reload the engine with the new model
+        }));
     }
 
     acc::SetParamNorm set_p_;
@@ -129,7 +155,9 @@ private:
     acc::FmtParam fmt_;
     acc::SetPrompt set_prompt_;
     std::function<bool()> model_ready_;
+    std::function<void()> on_model_changed_;
     std::string prompt_;
+    bool show_models_ = false;
 
     std::unique_ptr<pulp::view::View> native_ui_held_;  // stashed when not mounted
     pulp::view::View* native_ui_ptr_ = nullptr;

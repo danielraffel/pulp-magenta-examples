@@ -210,6 +210,12 @@ public:
             },
             [this](const std::string& p) { if (st_) st_->engine.set_text_prompt(p); },
             [] { std::error_code ec; return std::filesystem::exists(default_model(), ec); },  // model_ready
+            // on_model_changed (in-editor Models overlay, DAW). Must NOT rebuild the editor
+            // here — that would destroy the ModelSection mid-callback; the overlay's Done
+            // button refreshes the editor safely. Reloading the running engine from the shared
+            // store is the next slice (engine-store integration); the download itself completes
+            // here and is picked up on the next engine start.
+            [] {},
             env_or("MRT2_PROMPT", "warm analog pads"));
         editor_ = editor.get();
         return editor;
