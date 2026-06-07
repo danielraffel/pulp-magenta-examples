@@ -18,9 +18,17 @@ uv venv --python 3.12 && source .venv/bin/activate
 uv pip install "cmake<3.28"
 ```
 
-## 1. Model weights (headless)
+## 1. Model weights
 
-The `mrt models` picker needs a TTY; pass the model **NAME** and redirect stdin to run headless:
+> **E1 Promptable Accompanist downloads weights in-app** — launch it and use **⚙ Settings →
+> Models** to fetch a model (and its ~1.3 GB shared resources) into the shared store
+> `~/.pulp/magenta`; swapping models hot-reloads the engine with no restart. The headless demos
+> (E2, E3) have no UI, so for those install weights up front with the script below. The engine
+> resolves a model from the shared store first, then falls back to the legacy
+> `~/Documents/Magenta` layout the script populates.
+
+For the headless path, the `mrt models` picker needs a TTY; pass the model **NAME** and redirect
+stdin to run headless:
 
 ```bash
 uv pip install "magenta-rt[mlx]"

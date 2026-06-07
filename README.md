@@ -10,6 +10,23 @@ weights with one command, and (flagship) let an AI agent conduct a live MRT2 ins
 > [`magentart-wrapper/`](magentart-wrapper/). This project **floats to the latest Pulp SDK** so
 > it never goes stale — see [docs/SETUP.md](docs/SETUP.md).
 
+## Two ways to use these
+
+**A. Just play with the prebuilt plugins** — no build, no toolchain.
+Download the signed + notarized installer from the
+[latest release](https://github.com/danielraffel/pulp-magenta-examples/releases/latest)
+(`PromptableAccompanist-<version>.pkg`) and run it. Pick which formats to install
+(AU / VST3 / CLAP / Standalone). On first launch — the standalone app, or the plugin loaded on an
+instrument track in your DAW — open **⚙ Settings → Models** and download a model; the shared
+resources come down with it. Nothing else to set up. (Apple Silicon only.)
+
+**B. Build & develop with Magenta in Pulp** — you have the Pulp SDK installed and want to write
+your own Magenta-powered plugin, or hack on E1–E3. The examples build against your installed SDK
+via `find_package(Pulp)`. See [Build it yourself](#build-it-yourself) below — and note the
+model-manager (browse / download / set-default a model) is a **core Pulp SDK feature**
+(`<pulp/runtime/model_store.hpp>` + `<pulp/view/model_manager_view.hpp>`), so any plugin you write
+can offer the same picker — Magenta is just the first package to use it.
+
 ## Requirements (Apple Silicon only)
 
 - Apple Silicon Mac (M-series), macOS 14+.
@@ -21,27 +38,53 @@ weights with one command, and (flagship) let an AI agent conduct a live MRT2 ins
 
 `mrt2_small` (230M) runs real-time on any Apple Silicon; `mrt2_base` (2.4B) needs a Pro/Max.
 
-## Quickstart
+## Build it yourself
+
+You have the Pulp SDK installed, so the examples build straight against it.
 
 ```bash
-# 1. Install the model weights (headless; pass the NAME to skip the TTY picker)
-./scripts/install-weights.sh mrt2_small
+git clone https://github.com/danielraffel/pulp-magenta-examples
+cd pulp-magenta-examples
 
-# 2. Bring Magenta in via Pulp's package manager (resolves the local registry entry)
+# 1. Bring Magenta in via Pulp's package manager (resolves the local registry entry)
 pulp add magenta-realtime-2
 
-# 3. Build a demo (cross-format)
+# 2. Build the demos cross-format (AU / VST3 / CLAP / Standalone) — fetches + builds
+#    MLX / TensorFlow-Lite / the magentart wrapper on the first configure
 pulp build
 
-# 4. Validate with the format validators (auval / clap-validator)
+# 3. Validate (auval / clap-validator)
 pulp validate
 ```
+
+**Getting a model.** For the **E1 Promptable Accompanist** you don't need to pre-install weights —
+launch it and use **⚙ Settings → Models** to download one; the shared resources come with it, and
+swapping models hot-reloads the running engine (no restart). The headless demos
+(**E2 Agent Session**, **E3 Continuation**) have no UI, so install weights up front:
+
+```bash
+uv pip install "magenta-rt[mlx]"
+./scripts/install-weights.sh mrt2_small      # or mrt2_base (Pro/Max only)
+```
+
+### What this installs / downloads
+
+| When | What | Where | Size |
+|------|------|-------|------|
+| Prereqs (one-time) | Xcode **Metal Toolchain**, `uv`, `cmake<3.28` | system | ~688 MB + tooling |
+| First `pulp build` | MLX, TensorFlow-Lite, the magentart wrapper (FetchContent) | `build/_deps/` | a few GB, cached |
+| A model (in-app **or** `install-weights.sh`) | `mrt2_small` (~440 MB) or `mrt2_base` (~2.6 GB) | in-app → shared store `~/.pulp/magenta`; script → `~/Documents/Magenta` | 0.4–2.6 GB |
+| First model, in-app | shared resources (MusicCoCa + SpectroStream) | shared store `~/.pulp/magenta` | ~1.3 GB |
+| Install step (`pulp build --install` or the `.pkg`) | the plugins / app | `~/Library/Audio/Plug-Ins/{Components,VST3,CLAP}`, `/Applications` | — |
+
+Model weights are **CC-BY-4.0 (Google DeepMind)** — downloaded by you on demand, never bundled or
+redistributed here.
 
 ## What's here / planned
 
 | Demo | Kind | Status |
 |------|------|--------|
-| Promptable Accompanist (E1) | MIDI-conditioned generative instrument | **working, cross-format** — **AU (auval PASSES) + VST3 + CLAP + Standalone(.app)** — installable in Logic; generates from prompt + takes MIDI; **custom WebView UI** (prompt + controls, opt-in `-DPROMPTABLE_WEBVIEW_UI=ON`) |
+| Promptable Accompanist (E1) | MIDI-conditioned generative instrument | **working, cross-format** — **AU (auval PASSES) + VST3 + CLAP + Standalone(.app)** — installable in Logic; generates from prompt + takes MIDI. **GPU-native editor** (faders + prompt) by default, with an in-plugin **⚙ Settings → Models** picker (download / set-default / hot-reload) + auto resource fetch. Optional WebView editor via `-DPROMPTABLE_WEBVIEW_UI=ON` |
 | Agent-Conducted Session (E2) | flagship — `.pulpset` of agent steers (numeric) replayed to audio | **working** — headless conductor replays commands → non-silent audio; conducted build measurably raises energy (seg0→seg2). Live MCP-agent layer is the demo extension |
 | Continuation Effect (E3) | seed → prefill → generated continuation | **working** — token-prefill (lossless) branch; continuation coherent with seed, non-silent |
 | WebView UI (Phase 7) | custom editor — prompt box + control sliders, bridged to the engine | **working** — opt-in (`-DPROMPTABLE_WEBVIEW_UI=ON`); auval SUCCEEDED with a Cocoa view → shows in Logic; reference-surface (4/4) proves the control surface |
