@@ -23,9 +23,13 @@
 #include <pulp/midi/buffer.hpp>
 #include <pulp/state/store.hpp>
 
+#include <pulp/runtime/model_store.hpp>
+
 #include <magentart/mlx_engine.h>
 #include <magentart/ring_buffer.h>
 #include <magentart/detail/autorelease_pool.h>
+
+#include "magenta_models.hpp"  // kMagentaSubsystem — shared model store lookup
 
 // The custom WebView UI needs an SDK built with -DPULP_BUILD_WEBVIEW=ON. Without it the
 // plugin still works fully (audio + host/auto param UI); only the bespoke editor is
@@ -69,6 +73,26 @@ inline std::string default_resources() {
 // Magenta plugin/app finds them here.
 inline std::string default_model() {
     if (const char* e = std::getenv("MRT2_MODEL"); e && *e) return e;
+
+    // Prefer a model installed through the in-plugin / standalone Models overlay — i.e. the
+    // shared Pulp model store at ~/.pulp/magenta. That is what a plugin-only install
+    // downloads (the user may never touch the legacy ~/Documents/Magenta layout), so the
+    // engine must look there first. Require the `_state.safetensors` sibling too: a model
+    // is only loadable as a complete bundle, and gating on it keeps a pre-existing legacy
+    // install selected if the shared copy is a partial (e.g. weights-only) download.
+    namespace rt = pulp::runtime;
+    if (const std::string active = rt::read_active_model_id(magenta_demo::kMagentaSubsystem);
+        !active.empty()) {
+        const auto rec = rt::read_installed_model(magenta_demo::kMagentaSubsystem, active);
+        if (rec.checkpoint_exists && !rec.resolved_checkpoint_path.empty()) {
+            const auto& ckpt = rec.resolved_checkpoint_path;
+            const auto state = ckpt.parent_path() / (ckpt.stem().string() + "_state.safetensors");
+            std::error_code ec;
+            if (std::filesystem::exists(state, ec)) return ckpt.string();
+        }
+    }
+
+    // Legacy install path (scripts/install-weights.sh). Prefer the large model when present.
     const auto root = std::filesystem::path(env_or("HOME", "")) /
                       "Documents/Magenta/magenta-rt-v2/models";
     const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";   // large, preferred
