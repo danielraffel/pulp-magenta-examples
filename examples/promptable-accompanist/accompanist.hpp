@@ -29,7 +29,8 @@
 #include <magentart/ring_buffer.h>
 #include <magentart/detail/autorelease_pool.h>
 
-#include "magenta_models.hpp"  // kMagentaSubsystem — shared model store lookup
+#include "magenta_models.hpp"     // kMagentaSubsystem — shared model store lookup
+#include "magenta_resources.hpp"  // shared_resources_dir/_complete — resources resolution
 
 // The custom WebView UI needs an SDK built with -DPULP_BUILD_WEBVIEW=ON. Without it the
 // plugin still works fully (audio + host/auto param UI); only the bespoke editor is
@@ -63,8 +64,14 @@ inline std::string env_or(const char* key, const std::string& fallback) {
     return (v && *v) ? std::string(v) : fallback;
 }
 inline std::string default_resources() {
-    return env_or("MRT2_RESOURCES", (std::filesystem::path(env_or("HOME", "")) /
-                  "Documents/Magenta/magenta-rt-v2/resources").string());
+    if (const char* e = std::getenv("MRT2_RESOURCES"); e && *e) return e;
+    // Prefer the shared store (~/.pulp/magenta/resources) when the in-plugin overlay
+    // has downloaded the full set — that's what a plugin-only install populates. Fall
+    // back to the legacy ~/Documents/Magenta layout otherwise.
+    if (magenta_demo::shared_resources_complete())
+        return magenta_demo::shared_resources_dir().string();
+    return (std::filesystem::path(env_or("HOME", "")) /
+            "Documents/Magenta/magenta-rt-v2/resources").string();
 }
 // Resolve the model file. Explicit MRT2_MODEL wins; otherwise PREFER the large
 // model (mrt2_base, 2.4B — better quality, needs a Pro/Max Mac) when it's been

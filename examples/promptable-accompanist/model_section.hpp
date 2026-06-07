@@ -14,8 +14,10 @@
 #include <pulp/runtime/async_stream.hpp>
 
 #include "magenta_models.hpp"
+#include "magenta_resources.hpp"  // shared resources download (Gap 2)
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -111,14 +113,42 @@ private:
 
         const auto entry_copy = *entry;
         worker_ = std::thread([this, entry_copy] {
-            auto res = pulp::runtime::install_model(
-                entry_copy, kMagentaSubsystem,
-                [this](const pulp::runtime::DownloadProgress& p) {
-                    if (p.total) progress_.store(static_cast<float>(p.downloaded) / static_cast<float>(p.total));
-                    return !cancel_.is_cancelled();
-                },
-                &cancel_);
-            success_.store(res.ok, std::memory_order_release);
+            // The shared resources (~1.3 GB) are required by every model. A plugin-only
+            // install won't have them, so fetch any missing ones FIRST, then the model —
+            // one combined progress bar weighted by byte size so it advances smoothly
+            // across both phases regardless of each phase's internal progress units.
+            const std::uint64_t res_total =
+                shared_resources_complete() ? 0 : magenta_resources_total_bytes();
+            const std::uint64_t grand_total = res_total + entry_copy.size_bytes;
+            const double res_weight = grand_total ? static_cast<double>(res_total) / grand_total : 0.0;
+            const double model_weight =
+                grand_total ? static_cast<double>(entry_copy.size_bytes) / grand_total : 1.0;
+
+            bool ok = true;
+            if (res_total > 0) {
+                ok = download_resources(
+                    [this, res_weight](std::uint64_t done, std::uint64_t total) {
+                        if (total)
+                            progress_.store(static_cast<float>(res_weight * static_cast<double>(done) /
+                                                               static_cast<double>(total)));
+                        return !cancel_.is_cancelled();
+                    },
+                    &cancel_);
+            }
+            if (ok) {
+                auto res = pulp::runtime::install_model(
+                    entry_copy, kMagentaSubsystem,
+                    [this, res_weight, model_weight](const pulp::runtime::DownloadProgress& p) {
+                        if (p.total)
+                            progress_.store(static_cast<float>(
+                                res_weight + model_weight * static_cast<double>(p.downloaded) /
+                                                 static_cast<double>(p.total)));
+                        return !cancel_.is_cancelled();
+                    },
+                    &cancel_);
+                ok = res.ok;
+            }
+            success_.store(ok, std::memory_order_release);
             done_.store(true, std::memory_order_release);
         });
 
