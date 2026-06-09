@@ -268,6 +268,10 @@ public:
 
     void on_view_closed(view::View&) override { editor_ = nullptr; }
 
+    FreezeLoopSamplerStatus freeze_sampler_status() const noexcept {
+        return freeze_sampler_.status();
+    }
+
     // V2 contributes a "Models" tab to the host's unified Settings panel; the host composes
     // it alongside its own Audio/MIDI device tabs (Processor::settings_sections, MM-PR5).
     std::vector<format::Processor::SettingsSection> settings_sections() override {
