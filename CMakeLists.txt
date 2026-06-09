@@ -9,6 +9,7 @@ if(NOT APPLE)
 endif()
 
 find_package(Pulp REQUIRED)
+include(CTest)
 
 # `pulp build` (the CLI) resolves a published SDK whose PulpConfig fully exports the
 # plugin helpers. When consuming Pulp from a dev build TREE (Pulp_DIR=<pulp>/build) the
@@ -21,6 +22,7 @@ endif()
 add_subdirectory(magentart-wrapper)
 
 add_subdirectory(examples/promptable-accompanist)
+add_subdirectory(examples/promptable-accompanist-v2)
 add_subdirectory(examples/agent-session)
 add_subdirectory(examples/continuation)
 add_subdirectory(examples/reference-surface)
