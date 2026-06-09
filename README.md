@@ -29,7 +29,7 @@ can offer the same picker — Magenta is just the first package to use it.
 
 ## Requirements (Apple Silicon only)
 
-- Apple Silicon Mac (M-series), macOS 14+.
+- Apple Silicon Mac (M-series), macOS 15+.
 - Xcode + the **Metal Toolchain** component: `xcodebuild -downloadComponent MetalToolchain`
   (≈688 MB — required; MLX compiles Metal shaders at build time and it is **not** installed by
   default even with full Xcode).

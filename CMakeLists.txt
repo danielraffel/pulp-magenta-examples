@@ -1,7 +1,7 @@
 # pulp-magenta-examples — MRT2 example plugins for Pulp.
 # OBJCXX because magentart::core (MLX/Metal) needs the Objective-C++ toolchain.
 cmake_minimum_required(VERSION 3.27)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS deployment target")
 project(PulpMagentaExamples LANGUAGES C CXX OBJCXX)
 
 if(NOT APPLE)

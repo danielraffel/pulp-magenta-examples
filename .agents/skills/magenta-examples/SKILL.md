@@ -15,7 +15,7 @@ Session, Continuation Effect) in Pulp, or to add `magentart::core` to a Pulp pro
 
 ## Preconditions (check first, in order)
 
-1. **Apple Silicon + macOS 14+.** Otherwise stop — MRT2 is Metal/MLX-only.
+1. **Apple Silicon + macOS 15+.** Otherwise stop — MRT2 is Metal/MLX-only.
 2. **Metal Toolchain installed:** `xcrun metal --version` must succeed. If not:
    `xcodebuild -downloadComponent MetalToolchain` (~688 MB, one-time). This is the #1 gotcha —
    the build links fine without it but **aborts at generation**.

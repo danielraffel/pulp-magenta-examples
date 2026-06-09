@@ -1,4 +1,4 @@
-# Setup — validated recipe (Apple Silicon, macOS 14+)
+# Setup — validated recipe (Apple Silicon, macOS 15+)
 
 Every step below was empirically validated end-to-end: `magentart::core` builds and
 `hello_mrt2` generated non-silent audio. Follow it exactly — the non-obvious prerequisites

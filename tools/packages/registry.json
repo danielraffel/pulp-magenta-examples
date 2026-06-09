@@ -22,7 +22,7 @@
       "platforms": {
         "macOS": {
           "architectures": ["arm64"],
-          "min_version": "14.0",
+          "min_version": "15.0",
           "notes": "Apple Silicon only; requires Xcode Metal Toolchain (xcodebuild -downloadComponent MetalToolchain) and the MLX e9e20fa bump for Metal-26."
         }
       }

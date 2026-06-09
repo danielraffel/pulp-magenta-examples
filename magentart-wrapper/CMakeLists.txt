@@ -7,7 +7,7 @@
 # This is the package `pulp add magenta-realtime-2` points at (NOT the
 # upstream root, which hard-fails off-Apple and requires npm).
 cmake_minimum_required(VERSION 3.27)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS deployment target")
 project(magentart_core_wrapper LANGUAGES C CXX OBJCXX)
 
 if(NOT APPLE)
