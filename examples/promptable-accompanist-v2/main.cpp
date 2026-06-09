@@ -14,7 +14,10 @@ int main(int argc, char** argv) {
 
     pulp::format::StandaloneConfig config;
     config.sample_rate = 48000.0;   // MRT2 is 48 kHz native
-    config.buffer_size = 512;
+    config.buffer_size = 64;
+    config.allowed_sample_rates = {48000.0};  // MRT2 output is generated at 48 kHz.
+    config.allowed_buffer_sizes = {64};       // Known-good standalone block size for V2.
+    config.route_test_signal_to_output = true;
     config.input_channels = 0;      // instrument: no audio input
     config.output_channels = 2;
     config.show_settings_tab = true;   // host Settings: [Audio][MIDI] + the plugin's Models tab
