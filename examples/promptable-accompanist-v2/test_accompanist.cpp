@@ -35,6 +35,40 @@ void fill_constant_audio(pulp::audio::Buffer<float>& block, float value) {
     }
 }
 
+double max_abs_error_from(const pulp::audio::Buffer<float>& block, double expected) {
+    double max_error = 0.0;
+    for (std::size_t ch = 0; ch < block.num_channels(); ++ch) {
+        for (const auto sample : block.channel(ch)) {
+            const auto error = std::fabs(static_cast<double>(sample) - expected);
+            if (error > max_error) max_error = error;
+        }
+    }
+    return max_error;
+}
+
+double process_constant_blocks_and_measure_error(FreezeLoopSampler& sampler,
+                                                 pulp::audio::Buffer<float>& block,
+                                                 FreezeLoopSamplerControls controls,
+                                                 float live_value,
+                                                 double expected_output,
+                                                 int settle_blocks,
+                                                 int measure_blocks) {
+    for (int i = 0; i < settle_blocks; ++i) {
+        fill_constant_audio(block, live_value);
+        auto view = block.view();
+        sampler.process(view, controls);
+    }
+    double max_error = 0.0;
+    for (int i = 0; i < measure_blocks; ++i) {
+        fill_constant_audio(block, live_value);
+        auto view = block.view();
+        sampler.process(view, controls);
+        const auto block_error = max_abs_error_from(block, expected_output);
+        if (block_error > max_error) max_error = block_error;
+    }
+    return max_error;
+}
+
 bool wait_for_frozen_sample(FreezeLoopSampler& sampler,
                             pulp::audio::Buffer<float>& block,
                             FreezeLoopSamplerControls controls) {
@@ -125,6 +159,66 @@ int main() {
     CHECK(quick_sampler.status().materialize_failures == 0,
           "quick release/re-press has no materialization failure");
     quick_sampler.shutdown();
+
+    FreezeLoopSampler contract_sampler;
+    CHECK(contract_sampler.prepare(config), "audible contract sampler prepares");
+    for (int i = 0; i < 17; ++i) {
+        fill_constant_audio(block, 0.125f);
+        auto view = block.view();
+        contract_sampler.process(view, live_controls);
+    }
+    fill_constant_audio(block, 0.125f);
+    auto contract_freeze_view = block.view();
+    contract_sampler.process(contract_freeze_view, freeze_controls);
+    CHECK(wait_for_frozen_sample(contract_sampler, block, freeze_controls),
+          "audible contract sampler publishes first held loop");
+    const auto first_capture_count = contract_sampler.status().captures_completed;
+    CHECK(first_capture_count == 1, "first held loop counts as one capture");
+    const auto frozen_error = process_constant_blocks_and_measure_error(contract_sampler,
+                                                                        block,
+                                                                        freeze_controls,
+                                                                        0.75f,
+                                                                        0.125,
+                                                                        24,
+                                                                        4);
+    CHECK(frozen_error < 0.05,
+          "frozen loop renders held sample while live input changes");
+
+    const auto released_error = process_constant_blocks_and_measure_error(contract_sampler,
+                                                                          block,
+                                                                          live_controls,
+                                                                          -0.5f,
+                                                                          -0.5,
+                                                                          24,
+                                                                          4);
+    CHECK(released_error < 0.05,
+          "release returns output to live input");
+    CHECK(!contract_sampler.status().frozen, "release exits frozen playback state");
+
+    for (int i = 0; i < 40; ++i) {
+        fill_constant_audio(block, -0.25f);
+        auto view = block.view();
+        contract_sampler.process(view, live_controls);
+    }
+    fill_constant_audio(block, -0.25f);
+    auto contract_refreeze_view = block.view();
+    contract_sampler.process(contract_refreeze_view, freeze_controls);
+    CHECK(wait_for_frozen_sample(contract_sampler, block, freeze_controls),
+          "audible contract sampler publishes replacement held loop");
+    CHECK(contract_sampler.status().captures_completed == first_capture_count + 1,
+          "recapture replaces the frozen sample on the next hold");
+    const auto recaptured_error = process_constant_blocks_and_measure_error(contract_sampler,
+                                                                            block,
+                                                                            freeze_controls,
+                                                                            0.75f,
+                                                                            -0.25,
+                                                                            24,
+                                                                            4);
+    CHECK(recaptured_error < 0.05,
+          "recaptured loop renders the newer held sample");
+    CHECK(contract_sampler.status().materialize_failures == 0,
+          "audible contract path has no materialization failure");
+    contract_sampler.shutdown();
 
     FreezeLoopSampler shape_sampler;
     CHECK(shape_sampler.prepare(config), "shape guard sampler prepares");
