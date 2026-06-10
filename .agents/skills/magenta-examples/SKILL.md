@@ -42,6 +42,22 @@ pulp validate            # auval / clap-validator on the built formats
   delete `_deps/mlx-*` first (a shallow clone can't update to an unrelated SHA).
 - MRT2 is **generative, ~200 ms latency** — MIDI steers; it does not deterministically play notes.
   Set that expectation in any UX copy.
+- Keep **all MLXEngine mutation on one worker thread**. MLX streams/Metal command encoders are
+  thread-local, and touching `MLXEngine` from the audio/UI thread during load or generation can
+  make valid models go silent.
+- For live model switches, do **not** call `MLXEngine::unload()` before `load_model()`. In this
+  wrapper, `unload()` also drops the shared MusicCoCa/TFLite encoder assets loaded by
+  `init_assets()`, so the next prompt encode can fail with "model encoders failed to start" even
+  though the checkpoint itself loaded.
+- During hot reload, keep the previous model/audio ring alive until the replacement model is fully
+  loaded, encoded, and primed. If a requested model bundle or resource set is incomplete, report
+  that status but preserve the current loaded model so generated audio continues.
+- Treat model/resource install checks as **bundle completeness checks**, not existence checks:
+  weights, `_state.safetensors`, and shared resources must all be present with expected byte sizes
+  before an install is "available".
+- Add a generated-audio smoke for model work: load a real model, assert non-silent output, switch to
+  another installed model, assert output resumes, then request an intentionally incomplete model and
+  assert the previous model path and audible output survive.
 - Validate plugins with Pulp's test harness / `pulp validate` before installing to system folders.
 - CC-BY-4.0 weight attribution must travel into any shipped bundle (see `NOTICE.md`).
 
