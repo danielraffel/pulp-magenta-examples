@@ -286,7 +286,7 @@ private:
         wrap->flex().gap = 12.0f;
         wrap->flex().padding = 60.0f;
 
-        auto title = std::make_unique<pulp::view::Label>("Download a model to start generating audio.");
+        auto title = std::make_unique<pulp::view::Label>("You need to download a model to start generating audio.");
         title->set_font_size(17.0f);
         title->set_text_color(pulp::canvas::Color::rgba8(225, 225, 230, 255));
         wrap->add_child(std::move(title));

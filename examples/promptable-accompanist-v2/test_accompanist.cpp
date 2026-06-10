@@ -377,7 +377,7 @@ int check_runtime_status_priority() {
                                            true,
                                            RuntimeIssue::missing_model_bundle,
                                            0);
-    CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+    CHECK(processor.runtime_status_text().find("download a model") != std::string::npos,
           "missing local model status tells the user to download a model");
 
     processor.force_runtime_flags_for_test(false,
@@ -385,7 +385,7 @@ int check_runtime_status_priority() {
                                            false,
                                            RuntimeIssue::none,
                                            0);
-    CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+    CHECK(processor.runtime_status_text().find("download a model") != std::string::npos,
           "candidate-less loading state tells the user to download a model");
     CHECK(!processor.model_ready_for_editor_for_test(),
           "candidate-less loading state stays on the download-model gate");
@@ -426,7 +426,7 @@ int check_worker_preflight_rejections_do_not_publish_loading() {
               "missing model bundle does not publish loading");
         CHECK(!st->loading_model_candidate_valid.load(std::memory_order_acquire),
               "missing model bundle does not publish a valid loading candidate");
-        CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+        CHECK(processor.runtime_status_text().find("download a model") != std::string::npos,
               "missing model worker rejection tells the user to download a model");
     }
 

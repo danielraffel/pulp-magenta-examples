@@ -558,7 +558,7 @@ public:
                 case RuntimeIssue::missing_model_bundle:
                     if (loaded)
                         return "Model files are missing or incomplete. Open Settings > Models to download or repair a model.";
-                    return "Download a model in Settings > Models to start generating audio.";
+                    return "You need to download a model in Settings > Models to start generating audio.";
                 case RuntimeIssue::unsupported_model:
                     return "This Mac can run the Small model in real time. Open Settings > Models to download or select Small.";
                 case RuntimeIssue::encoder_failed:
@@ -573,7 +573,7 @@ public:
         if (!loaded) {
             if (st->loading.load(std::memory_order_acquire)) {
                 if (!st->loading_model_candidate_valid.load(std::memory_order_acquire))
-                    return "Download a model in Settings > Models to start generating audio.";
+                    return "You need to download a model in Settings > Models to start generating audio.";
                 return "Loading Magenta model...";
             }
             return {};
