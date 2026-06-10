@@ -272,6 +272,7 @@ struct EngineState {
     magentart::core::MLXEngine engine;
     magentart::core::RingBuffer ring_l, ring_r;
     std::atomic<bool> running{true}, loaded{false}, loading{false};
+    std::atomic<bool> loading_model_candidate_valid{false};
     std::atomic<bool> load_failed{false}, generation_failed{false};
     std::atomic<std::uint32_t> runtime_issue{issue_value(RuntimeIssue::none)};
     std::atomic<std::uint64_t> generated_frames{0}, underrun_blocks{0};
@@ -313,10 +314,11 @@ struct EngineState {
         }
         reload_requested.store(false, std::memory_order_release);
         loading.store(false, std::memory_order_release);
+        loading_model_candidate_valid.store(false, std::memory_order_release);
         loaded.store(false, std::memory_order_release);
-        load_failed.store(true, std::memory_order_release);
         generation_failed.store(false, std::memory_order_release);
         runtime_issue.store(issue_value(issue), std::memory_order_release);
+        load_failed.store(true, std::memory_order_release);
         generated_frames.store(0, std::memory_order_relaxed);
         underrun_blocks.store(0, std::memory_order_relaxed);
     }
@@ -513,6 +515,16 @@ public:
         if (st_) st_->set_prompt(prompt);
     }
 
+    void set_engine_state_for_test(std::shared_ptr<EngineState> st) {
+        st_ = std::move(st);
+    }
+
+    static WorkerLoadOutcome worker_load_for_test(const std::shared_ptr<EngineState>& st,
+                                                  const std::string& checkpoint_path,
+                                                  bool assets_ok) {
+        return worker_load(st, checkpoint_path, assets_ok);
+    }
+
     bool prompt_change_applied_for_test() const {
         const auto st = st_;
         if (!st) return false;
@@ -524,10 +536,13 @@ public:
                                       bool loading,
                                       bool load_failed,
                                       RuntimeIssue issue,
-                                      std::uint64_t generated_frames) {
+                                      std::uint64_t generated_frames,
+                                      bool loading_model_candidate_valid = false) {
         if (!st_) st_ = std::make_shared<EngineState>();
         st_->loaded.store(loaded, std::memory_order_release);
         st_->loading.store(loading, std::memory_order_release);
+        st_->loading_model_candidate_valid.store(loading_model_candidate_valid,
+                                                 std::memory_order_release);
         st_->load_failed.store(load_failed, std::memory_order_release);
         st_->generation_failed.store(issue == RuntimeIssue::generation_failed,
                                      std::memory_order_release);
@@ -563,8 +578,11 @@ public:
             }
         }
         if (!loaded) {
-            if (st->loading.load(std::memory_order_acquire))
+            if (st->loading.load(std::memory_order_acquire)) {
+                if (!st->loading_model_candidate_valid.load(std::memory_order_acquire))
+                    return "Download a model in Settings > Models to start generating audio.";
                 return "Loading Magenta model...";
+            }
             return {};
         }
 
@@ -656,14 +674,16 @@ private:
         const bool had_loaded_model = st->loaded.load(std::memory_order_acquire);
         auto fail = [&](RuntimeIssue issue, bool keep_current_model) {
             st->loading.store(false, std::memory_order_release);
-            st->load_failed.store(true, std::memory_order_release);
+            st->loading_model_candidate_valid.store(false, std::memory_order_release);
             st->runtime_issue.store(issue_value(issue), std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
             if (!keep_current_model)
                 st->loaded.store(false, std::memory_order_release);
             return keep_current_model ? WorkerLoadOutcome::preserved_current_model
                                       : WorkerLoadOutcome::failed;
         };
-        st->loading.store(true, std::memory_order_release);
+        st->loading.store(false, std::memory_order_release);
+        st->loading_model_candidate_valid.store(false, std::memory_order_release);
         st->load_failed.store(false, std::memory_order_release);
         st->generation_failed.store(false, std::memory_order_release);
         st->runtime_issue.store(issue_value(RuntimeIssue::none), std::memory_order_release);
@@ -680,6 +700,8 @@ private:
                                  path + "'");
             return fail(RuntimeIssue::unsupported_model, had_loaded_model);
         }
+        st->loading_model_candidate_valid.store(true, std::memory_order_release);
+        st->loading.store(true, std::memory_order_release);
 
         bool loaded = false;
         try {
@@ -727,6 +749,7 @@ private:
         { std::lock_guard<std::mutex> lk(st->mutex_); st->loaded_model_path = path; }
         magenta_v2_debug_log("model load complete for '" + path + "'");
         st->loading.store(false, std::memory_order_release);
+        st->loading_model_candidate_valid.store(false, std::memory_order_release);
         return WorkerLoadOutcome::loaded;
     }
 
@@ -739,10 +762,10 @@ private:
             apply_realtime_inputs(st);
             const auto start = std::chrono::steady_clock::now();
             if (!st->engine.generate_frame(L, R)) {
-                st->generation_failed.store(true, std::memory_order_release);
-                st->load_failed.store(true, std::memory_order_release);
                 st->runtime_issue.store(issue_value(RuntimeIssue::generation_failed),
                                         std::memory_order_release);
+                st->generation_failed.store(true, std::memory_order_release);
+                st->load_failed.store(true, std::memory_order_release);
                 return false;
             }
             const auto end = std::chrono::steady_clock::now();
@@ -761,10 +784,10 @@ private:
         if (!st->running.load(std::memory_order_relaxed)) return false;
         if (!st->ring_l.write(L, mc::kFrameSamples) ||
             !st->ring_r.write(R, mc::kFrameSamples)) {
-            st->generation_failed.store(true, std::memory_order_release);
-            st->load_failed.store(true, std::memory_order_release);
             st->runtime_issue.store(issue_value(RuntimeIssue::generation_failed),
                                     std::memory_order_release);
+            st->generation_failed.store(true, std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
             return false;
         }
         st->generated_frames.fetch_add(1, std::memory_order_relaxed);
@@ -838,6 +861,7 @@ private:
                     magenta_v2_debug_log("reload skipped; requested model is already loaded: '" +
                                          path + "'");
                     st->loading.store(false, std::memory_order_release);
+                    st->loading_model_candidate_valid.store(false, std::memory_order_release);
                     st->load_failed.store(false, std::memory_order_release);
                     st->generation_failed.store(false, std::memory_order_release);
                     st->runtime_issue.store(issue_value(RuntimeIssue::none),
@@ -852,6 +876,9 @@ private:
                     st->load_failed.store(false, std::memory_order_release);
                 } else if (load_outcome == WorkerLoadOutcome::loaded) {
                     st->loaded.store(false, std::memory_order_release);
+                    st->runtime_issue.store(issue_value(RuntimeIssue::generation_failed),
+                                            std::memory_order_release);
+                    st->generation_failed.store(true, std::memory_order_release);
                     st->load_failed.store(true, std::memory_order_release);
                 }
             }

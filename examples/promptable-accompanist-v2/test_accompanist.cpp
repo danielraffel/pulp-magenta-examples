@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -381,11 +382,85 @@ int check_runtime_status_priority() {
 
     processor.force_runtime_flags_for_test(false,
                                            true,
+                                           false,
+                                           RuntimeIssue::none,
+                                           0);
+    CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+          "candidate-less loading state tells the user to download a model");
+
+    processor.force_runtime_flags_for_test(false,
+                                           true,
+                                           false,
+                                           RuntimeIssue::none,
+                                           0,
+                                           true);
+    CHECK(processor.runtime_status_text().find("Loading Magenta model") != std::string::npos,
+          "valid candidate loading state still reports model loading");
+
+    processor.force_runtime_flags_for_test(false,
+                                           true,
                                            true,
                                            RuntimeIssue::unsupported_model,
                                            0);
     CHECK(processor.runtime_status_text().find("Small model") != std::string::npos,
           "unsupported real-time model status points users to Small");
+    return 0;
+}
+
+int check_worker_preflight_rejections_do_not_publish_loading() {
+    const auto home = unique_temp_dir("pulp-magenta-v2-preflight-status");
+
+    {
+        Processor processor;
+        auto st = std::make_shared<EngineState>();
+        processor.set_engine_state_for_test(st);
+        const auto missing = home / "mrt2_small/mrt2_small.mlxfn";
+        const auto outcome = Processor::worker_load_for_test(st, missing.string(), true);
+        CHECK(outcome == WorkerLoadOutcome::failed,
+              "missing model bundle is rejected by the worker preflight path");
+        CHECK(!st->loading.load(std::memory_order_acquire),
+              "missing model bundle does not publish loading");
+        CHECK(!st->loading_model_candidate_valid.load(std::memory_order_acquire),
+              "missing model bundle does not publish a valid loading candidate");
+        CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+              "missing model worker rejection tells the user to download a model");
+    }
+
+    {
+        Processor processor;
+        auto st = std::make_shared<EngineState>();
+        processor.set_engine_state_for_test(st);
+        const auto small = home / "mrt2_small/mrt2_small.mlxfn";
+        touch_model_file(small);
+        touch_model_file(home / "mrt2_small/mrt2_small_state.safetensors");
+        const auto outcome = Processor::worker_load_for_test(st, small.string(), false);
+        CHECK(outcome == WorkerLoadOutcome::failed,
+              "missing resources are rejected by the worker preflight path");
+        CHECK(!st->loading.load(std::memory_order_acquire),
+              "missing resources do not publish loading");
+        CHECK(processor.runtime_status_text().find("resources are incomplete") != std::string::npos,
+              "missing resources worker rejection points to model repair");
+    }
+
+    {
+        EnvGuard hardware_guard("PULP_MAGENTA_V2_HW_MODEL", "MacBookPro18,4");
+        EnvGuard unsupported_guard("PULP_MAGENTA_V2_ALLOW_UNSUPPORTED_MODEL", nullptr);
+        Processor processor;
+        auto st = std::make_shared<EngineState>();
+        processor.set_engine_state_for_test(st);
+        const auto base = home / "mrt2_base/mrt2_base.mlxfn";
+        touch_model_file(base);
+        touch_model_file(home / "mrt2_base/mrt2_base_state.safetensors");
+        const auto outcome = Processor::worker_load_for_test(st, base.string(), true);
+        CHECK(outcome == WorkerLoadOutcome::failed,
+              "unsupported M1-family model is rejected by the worker preflight path");
+        CHECK(!st->loading.load(std::memory_order_acquire),
+              "unsupported M1-family model does not publish loading");
+        CHECK(processor.runtime_status_text().find("Small model") != std::string::npos,
+              "unsupported M1-family model points users to Small");
+    }
+
+    std::filesystem::remove_all(home);
     return 0;
 }
 
@@ -650,6 +725,8 @@ int main() {
     if (m1_resolver_result != 0) return m1_resolver_result;
     const int runtime_status_result = check_runtime_status_priority();
     if (runtime_status_result != 0) return runtime_status_result;
+    const int worker_preflight_result = check_worker_preflight_rejections_do_not_publish_loading();
+    if (worker_preflight_result != 0) return worker_preflight_result;
     const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
     if (status_banner_result != 0) return status_banner_result;
     const int prompt_clear_result = check_prompt_clear_contract();
