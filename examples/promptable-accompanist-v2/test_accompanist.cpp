@@ -380,6 +380,14 @@ int check_runtime_status_priority() {
     CHECK(processor.runtime_status_text().find("download a model") != std::string::npos,
           "missing local model status tells the user to download a model");
 
+    processor.force_runtime_flags_for_test(true,
+                                           false,
+                                           true,
+                                           RuntimeIssue::missing_model_bundle,
+                                           4);
+    CHECK(processor.runtime_status_text().find("download or repair a model") != std::string::npos,
+          "deleted loaded model status tells the user to download or repair a model");
+
     processor.force_runtime_flags_for_test(false,
                                            true,
                                            false,

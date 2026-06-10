@@ -557,7 +557,7 @@ public:
                     return "Magenta resources are incomplete. Open Settings > Models to repair the install.";
                 case RuntimeIssue::missing_model_bundle:
                     if (loaded)
-                        return "Model files are missing or incomplete. Open Settings > Models to download or repair a model.";
+                        return "You need to download or repair a model in Settings > Models to keep generating audio.";
                     return "You need to download a model in Settings > Models to start generating audio.";
                 case RuntimeIssue::unsupported_model:
                     return "This Mac can run the Small model in real time. Open Settings > Models to download or select Small.";
