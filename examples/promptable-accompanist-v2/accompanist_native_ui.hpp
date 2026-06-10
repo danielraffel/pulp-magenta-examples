@@ -19,7 +19,7 @@ namespace pulp::examples::accompanist_v2 {
 using SetParamNorm = std::function<void(std::uint32_t, float)>;        // normalized 0..1
 using GetParamNorm = std::function<float(std::uint32_t)>;
 using FmtParam     = std::function<std::string(std::uint32_t)>;       // formatted actual value
-using SetPrompt    = std::function<void(const std::string&)>;         // -> engine.set_text_prompt
+using SetPrompt    = std::function<void(const std::string&)>;         // publishes desired prompt
 
 // Magenta tokens (examples/common/react_ui/colors.ts).
 namespace mag {
@@ -62,7 +62,7 @@ public:
         add_child(std::move(sub));
 
         auto prompt_box = std::make_unique<view::TextEditor>();
-        prompt_box->set_text(prompt.empty() ? std::string("warm analog pads") : prompt);
+        prompt_box->set_text(prompt);
         prompt_box->placeholder = "describe the music...";
         prompt_box->set_font_size(14);
         prompt_box->set_background_color(mag::panel());

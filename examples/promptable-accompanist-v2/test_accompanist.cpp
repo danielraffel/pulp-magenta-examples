@@ -5,6 +5,7 @@
 #include "freeze_loop_sampler.hpp"
 
 #include <pulp/runtime/scoped_no_alloc.hpp>
+#include <pulp/view/text_editor.hpp>
 
 #include <array>
 #include <chrono>
@@ -337,6 +338,36 @@ int check_status_banner_refreshes_after_late_frame_clock() {
     return 0;
 }
 
+int check_prompt_clear_contract() {
+    CHECK(prompt_has_text_conditioning("warm analog pads"),
+          "non-empty prompt uses text conditioning");
+    CHECK(!prompt_has_text_conditioning(""),
+          "empty prompt disables text conditioning");
+    CHECK(!prompt_has_text_conditioning(" \n\t"),
+          "whitespace-only prompt disables text conditioning");
+    const auto changed_at = std::chrono::steady_clock::time_point{} +
+                            std::chrono::milliseconds(1000);
+    CHECK(!prompt_change_is_settled(changed_at, changed_at + std::chrono::milliseconds(250)),
+          "prompt edits debounce transient empty replacement states");
+    CHECK(prompt_change_is_settled(changed_at, changed_at + kPromptApplyDebounce),
+          "prompt edits apply after the debounce window");
+
+    auto view = make_accompanist_native_view(
+        [](std::uint32_t, float) {},
+        [](std::uint32_t) { return 0.5f; },
+        [](std::uint32_t) { return std::string("0"); },
+        [](const std::string&) {},
+        "");
+    CHECK(view->child_count() >= 3, "native editor renders a prompt field");
+    auto* prompt_box = dynamic_cast<pulp::view::TextEditor*>(view->child_at(2));
+    CHECK(prompt_box != nullptr, "prompt field is a TextEditor");
+    CHECK(prompt_box->text().empty(),
+          "empty prompt remains empty instead of restoring the startup default");
+    CHECK(prompt_box->placeholder == "describe the music...",
+          "empty prompt is represented by placeholder text");
+    return 0;
+}
+
 std::string alternate_model_path_for_runtime_smoke(const std::string& current) {
     const auto shared = pulp::runtime::resolve_pulp_home() / "magenta/models";
     const auto legacy = std::filesystem::path(env_or("HOME", "")) /
@@ -380,6 +411,18 @@ bool wait_for_runtime_status_containing(Processor& processor,
         sleep_for_runtime_block(output);
         if (processor.runtime_status_text().find(needle) != std::string::npos)
             return true;
+    }
+    return false;
+}
+
+bool wait_for_prompt_change_applied(Processor& processor,
+                                    pulp::audio::Buffer<float>& output,
+                                    std::uint64_t& block_index,
+                                    int max_blocks) {
+    for (int i = 0; i < max_blocks; ++i) {
+        process_runtime_block(processor, output, block_index++);
+        sleep_for_runtime_block(output);
+        if (processor.prompt_change_applied_for_test()) return true;
     }
     return false;
 }
@@ -450,6 +493,16 @@ int run_generated_runtime_smoke_if_requested() {
     CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 240),
           "runtime smoke resumes generated audio after release");
 
+    processor.set_prompt_for_test("   \n");
+    CHECK(!processor.prompt_change_applied_for_test(),
+          "runtime smoke clear prompt waits for the prompt debounce");
+    CHECK(wait_for_prompt_change_applied(processor, output, block_index, 240),
+          "runtime smoke eventually applies a settled clear prompt");
+    CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 240),
+          "runtime smoke keeps generated audio alive when the prompt is cleared");
+    CHECK(processor.runtime_status_text().find("failed") == std::string::npos,
+          "runtime smoke clear prompt does not fail model encoders");
+
     const std::string hot_switch_model = alternate_model_path_for_runtime_smoke(default_model());
     if (!hot_switch_model.empty()) {
         processor.request_model_reload_for_test(hot_switch_model);
@@ -505,6 +558,8 @@ int main() {
     if (active_bundle_result != 0) return active_bundle_result;
     const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
     if (status_banner_result != 0) return status_banner_result;
+    const int prompt_clear_result = check_prompt_clear_contract();
+    if (prompt_clear_result != 0) return prompt_clear_result;
 
     Processor p;
     auto d = p.descriptor();

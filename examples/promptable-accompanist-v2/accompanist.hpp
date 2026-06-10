@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -53,6 +54,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace pulp::examples::accompanist_v2 {
@@ -60,6 +62,31 @@ namespace pulp::examples::accompanist_v2 {
 inline std::string env_or(const char* key, const std::string& fallback) {
     const char* v = std::getenv(key);
     return (v && *v) ? std::string(v) : fallback;
+}
+
+inline std::string default_prompt() {
+    return env_or("MRT2_PROMPT", "warm analog pads");
+}
+
+inline bool prompt_has_text_conditioning(std::string_view prompt) {
+    return std::any_of(prompt.begin(), prompt.end(), [](unsigned char c) {
+        return std::isspace(c) == 0;
+    });
+}
+
+inline constexpr std::chrono::milliseconds kPromptApplyDebounce{500};
+
+inline bool prompt_change_is_settled(std::chrono::steady_clock::time_point changed_at,
+                                     std::chrono::steady_clock::time_point now) {
+    return now >= changed_at + kPromptApplyDebounce;
+}
+
+inline void apply_prompt_to_engine(magentart::core::MLXEngine& engine,
+                                   const std::string& prompt) {
+    if (prompt_has_text_conditioning(prompt))
+        engine.set_text_prompt(prompt);
+    else
+        engine.set_musiccoca_tokens_masked();
 }
 
 inline bool magenta_v2_debug_enabled() {
@@ -163,7 +190,7 @@ struct EngineState {
     std::array<std::atomic<bool>, 128> desired_notes{};
     std::array<bool, 128> applied_notes{};
     std::atomic<std::uint64_t> prompt_revision{1};
-    std::uint64_t applied_prompt_revision = 0;
+    std::atomic<std::uint64_t> applied_prompt_revision{0};
 
     // Live model hot-reload. MLX makes streams/encoders thread_local, so the
     // model swap MUST run on the worker thread, not in the UI callback that asks
@@ -174,6 +201,7 @@ struct EngineState {
     std::mutex mutex_;                 // guards pending_model_path/current_prompt/loaded_model_path
     std::string pending_model_path;
     std::string current_prompt;
+    std::chrono::steady_clock::time_point prompt_changed_at = std::chrono::steady_clock::now();
     std::string loaded_model_path;
 
     void request_reload(std::string checkpoint_path) {
@@ -184,7 +212,12 @@ struct EngineState {
     // The worker is the only thread that calls MLXEngine. UI/audio threads publish
     // desired prompt/control state here; worker_run applies it before generation.
     void set_prompt(const std::string& p) {
-        { std::lock_guard<std::mutex> lk(mutex_); current_prompt = p; }
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            current_prompt = p;
+            prompt_changed_at = now;
+        }
         prompt_revision.fetch_add(1, std::memory_order_release);
     }
 };
@@ -235,7 +268,7 @@ public:
         freeze_sampler_.prepare(sampler_config);
         if (!worker_started_.exchange(true)) {
             st_ = std::make_shared<EngineState>();
-            st_->current_prompt = env_or("MRT2_PROMPT", "warm analog pads");  // before worker loads
+            st_->current_prompt = default_prompt();  // before worker loads
             st_->ring_l.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
             st_->ring_r.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
             auto st = st_;                                 // worker holds a ref
@@ -337,7 +370,7 @@ public:
             // must NOT rebuild the editor here (that would destroy the ModelSection mid-callback);
             // the overlay's Done button refreshes the editor safely.
             [this] { if (st_) st_->request_reload(default_model()); },
-            env_or("MRT2_PROMPT", "warm analog pads"));
+            current_prompt_for_view());
         editor_ = editor.get();
         return editor;
     }
@@ -358,6 +391,17 @@ public:
         if (!st) return {};
         std::lock_guard<std::mutex> lk(st->mutex_);
         return st->loaded_model_path;
+    }
+
+    void set_prompt_for_test(const std::string& prompt) {
+        if (st_) st_->set_prompt(prompt);
+    }
+
+    bool prompt_change_applied_for_test() const {
+        const auto st = st_;
+        if (!st) return false;
+        return st->applied_prompt_revision.load(std::memory_order_acquire) ==
+               st->prompt_revision.load(std::memory_order_acquire);
     }
 #endif
 
@@ -410,6 +454,13 @@ public:
         return sections;
     }
 private:
+    std::string current_prompt_for_view() const {
+        const auto st = st_;
+        if (!st) return default_prompt();
+        std::lock_guard<std::mutex> lk(st->mutex_);
+        return st->current_prompt;
+    }
+
     static void apply_realtime_inputs(const std::shared_ptr<EngineState>& st) {
         st->engine.set_temperature(st->temperature.load(std::memory_order_relaxed));
         st->engine.set_top_k(st->top_k.load(std::memory_order_relaxed));
@@ -428,11 +479,18 @@ private:
         }
 
         const auto revision = st->prompt_revision.load(std::memory_order_acquire);
-        if (revision != st->applied_prompt_revision) {
+        if (revision != st->applied_prompt_revision.load(std::memory_order_acquire)) {
             std::string prompt;
-            { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
-            st->engine.set_text_prompt(prompt);
-            st->applied_prompt_revision = revision;
+            std::chrono::steady_clock::time_point changed_at;
+            {
+                std::lock_guard<std::mutex> lk(st->mutex_);
+                prompt = st->current_prompt;
+                changed_at = st->prompt_changed_at;
+            }
+            if (!prompt_change_is_settled(changed_at, std::chrono::steady_clock::now()))
+                return;
+            apply_prompt_to_engine(st->engine, prompt);
+            st->applied_prompt_revision.store(revision, std::memory_order_release);
         }
     }
 
@@ -496,8 +554,9 @@ private:
 
         std::string prompt;
         { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
-        st->engine.set_text_prompt(prompt);
-        st->applied_prompt_revision = st->prompt_revision.load(std::memory_order_acquire);
+        apply_prompt_to_engine(st->engine, prompt);
+        st->applied_prompt_revision.store(st->prompt_revision.load(std::memory_order_acquire),
+                                          std::memory_order_release);
         while (st->running.load() &&
                (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
             std::this_thread::sleep_for(10ms);
