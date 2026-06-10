@@ -19,6 +19,7 @@
 #include <pulp/runtime/model_store.hpp>     // resolve_pulp_home
 #include <pulp/runtime/async_stream.hpp>    // CancellationToken
 
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -67,13 +68,35 @@ inline std::filesystem::path shared_resources_dir() {
     return pulp::runtime::resolve_pulp_home() / "magenta" / "resources";
 }
 
+inline std::filesystem::path legacy_resources_dir() {
+    return std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : "") /
+           "Documents/Magenta/magenta-rt-v2/resources";
+}
+
+// All required resource files present on disk at this resources root?
+inline bool resources_complete_at(const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& f : magenta_resource_files()) {
+        const auto path = dir / f.rel_path;
+        if (!std::filesystem::exists(path, ec)) return false;
+        ec.clear();
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size != f.size_bytes) return false;
+    }
+    return true;
+}
+
 // All required resource files present on disk in the shared store?
 inline bool shared_resources_complete() {
-    const auto dir = shared_resources_dir();
-    std::error_code ec;
-    for (const auto& f : magenta_resource_files())
-        if (!std::filesystem::exists(dir / f.rel_path, ec)) return false;
-    return true;
+    return resources_complete_at(shared_resources_dir());
+}
+
+inline bool legacy_resources_complete() {
+    return resources_complete_at(legacy_resources_dir());
+}
+
+inline bool runtime_resources_complete() {
+    return shared_resources_complete() || legacy_resources_complete();
 }
 
 inline std::uint64_t magenta_resources_total_bytes() {
@@ -101,9 +124,16 @@ inline bool download_resources(
         const auto dest = dir / f.rel_path;
         std::error_code ec;
         if (std::filesystem::exists(dest, ec)) {  // already have it
-            completed_bytes += f.size_bytes;
-            if (on_file_progress && !on_file_progress(completed_bytes, total)) return false;
-            continue;
+            ec.clear();
+            const auto existing_size = std::filesystem::file_size(dest, ec);
+            if (ec || existing_size != f.size_bytes) {
+                std::filesystem::remove(dest, ec);
+                ec.clear();
+            } else {
+                completed_bytes += f.size_bytes;
+                if (on_file_progress && !on_file_progress(completed_bytes, total)) return false;
+                continue;
+            }
         }
         std::filesystem::create_directories(dest.parent_path(), ec);
 

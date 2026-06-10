@@ -6,6 +6,7 @@
 
 #include <pulp/runtime/scoped_no_alloc.hpp>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -57,6 +58,18 @@ void touch_file(const std::filesystem::path& path) {
     std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path);
     file << "x";
+}
+
+void touch_model_file(const std::filesystem::path& path) {
+    touch_file(path);
+    const auto expected = magenta_demo::expected_magenta_model_file_size(path);
+    if (expected > 0) std::filesystem::resize_file(path, expected);
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path);
+    file << text;
 }
 
 void fill_test_audio(pulp::audio::Buffer<float>& block, int block_index) {
@@ -234,13 +247,54 @@ int check_model_registry_defaults() {
     const auto root = home / "Documents/Magenta/magenta-rt-v2/models";
     const auto small = root / "mrt2_small/mrt2_small.mlxfn";
     const auto base = root / "mrt2_base/mrt2_base.mlxfn";
-    touch_file(base);
-    touch_file(small);
+    touch_model_file(base);
+    touch_model_file(root / "mrt2_base/mrt2_base_state.safetensors");
+    touch_model_file(small);
+    touch_model_file(root / "mrt2_small/mrt2_small_state.safetensors");
     CHECK(default_model() == small.string(), "legacy resolver prefers small when both models exist");
 
     std::filesystem::remove(small);
     CHECK(default_model() == base.string(), "legacy resolver falls back to base when small is absent");
     std::filesystem::remove_all(home);
+    return 0;
+}
+
+int check_active_model_requires_complete_bundle() {
+    const auto home = unique_temp_dir("pulp-magenta-v2-active-bundle");
+    const auto legacy_home = unique_temp_dir("pulp-magenta-v2-legacy-bundle");
+    EnvGuard home_guard("HOME", legacy_home.c_str());
+    EnvGuard pulp_home_guard("PULP_HOME", home.c_str());
+    EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+
+    const auto shared = home / "magenta/models/mrt2_small/mrt2_small.mlxfn";
+    touch_model_file(shared);
+    write_text_file(home / "magenta/models/mrt2_small.json",
+                    "{\n"
+                    "  \"model_id\": \"mrt2_small\",\n"
+                    "  \"backend\": \"mlx\",\n"
+                    "  \"checkpoint_ref\": \"hf://google/magenta-realtime-2/models/mrt2_small/mrt2_small.mlxfn\",\n"
+                    "  \"resolved_checkpoint_path\": \"" + shared.string() + "\"\n"
+                    "}\n");
+    write_text_file(home / "magenta/model-state.json",
+                    "{\n"
+                    "  \"active_model_id\": \"mrt2_small\",\n"
+                    "  \"configured_model_id\": \"mrt2_small\",\n"
+                    "  \"resolved_checkpoint_path\": \"" + shared.string() + "\"\n"
+                    "}\n");
+
+    const auto legacy_root = legacy_home / "Documents/Magenta/magenta-rt-v2/models";
+    const auto legacy_small = legacy_root / "mrt2_small/mrt2_small.mlxfn";
+    touch_model_file(legacy_small);
+    touch_model_file(legacy_root / "mrt2_small/mrt2_small_state.safetensors");
+    CHECK(default_model().empty(),
+          "incomplete active shared model does not silently fall back to a legacy model");
+
+    touch_model_file(home / "magenta/models/mrt2_small/mrt2_small_state.safetensors");
+    CHECK(default_model() == shared.string(),
+          "complete active shared model resolves to the shared checkpoint");
+
+    std::filesystem::remove_all(home);
+    std::filesystem::remove_all(legacy_home);
     return 0;
 }
 
@@ -281,6 +335,53 @@ int check_status_banner_refreshes_after_late_frame_clock() {
     CHECK(root_ptr->child_count() == 2,
           "runtime status banner clears when the later warning resolves");
     return 0;
+}
+
+std::string alternate_model_path_for_runtime_smoke(const std::string& current) {
+    const auto shared = pulp::runtime::resolve_pulp_home() / "magenta/models";
+    const auto legacy = std::filesystem::path(env_or("HOME", "")) /
+                        "Documents/Magenta/magenta-rt-v2/models";
+    const std::array<std::filesystem::path, 4> candidates = {
+        shared / "mrt2_base/mrt2_base.mlxfn",
+        shared / "mrt2_small/mrt2_small.mlxfn",
+        legacy / "mrt2_base/mrt2_base.mlxfn",
+        legacy / "mrt2_small/mrt2_small.mlxfn",
+    };
+    for (const auto& candidate : candidates)
+        if (candidate.string() != current && model_bundle_complete(candidate))
+            return candidate.string();
+    return {};
+}
+
+bool wait_for_loaded_model_path(Processor& processor,
+                                pulp::audio::Buffer<float>& output,
+                                std::uint64_t& block_index,
+                                const std::string& expected_path,
+                                int max_blocks) {
+    for (int i = 0; i < max_blocks; ++i) {
+        process_runtime_block(processor, output, block_index++);
+        sleep_for_runtime_block(output);
+        if (processor.loaded_model_path_for_test() == expected_path) return true;
+        const auto status = processor.runtime_status_text();
+        if (status.find("failed") != std::string::npos ||
+            status.find("stopped") != std::string::npos)
+            return false;
+    }
+    return false;
+}
+
+bool wait_for_runtime_status_containing(Processor& processor,
+                                        pulp::audio::Buffer<float>& output,
+                                        std::uint64_t& block_index,
+                                        const std::string& needle,
+                                        int max_blocks) {
+    for (int i = 0; i < max_blocks; ++i) {
+        process_runtime_block(processor, output, block_index++);
+        sleep_for_runtime_block(output);
+        if (processor.runtime_status_text().find(needle) != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 int run_generated_runtime_smoke_if_requested() {
@@ -348,6 +449,34 @@ int run_generated_runtime_smoke_if_requested() {
 
     CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 240),
           "runtime smoke resumes generated audio after release");
+
+    const std::string hot_switch_model = alternate_model_path_for_runtime_smoke(default_model());
+    if (!hot_switch_model.empty()) {
+        processor.request_model_reload_for_test(hot_switch_model);
+        CHECK(wait_for_loaded_model_path(processor, output, block_index, hot_switch_model, 2400),
+              "runtime smoke hot-switches to another installed model");
+        const auto status = processor.runtime_status_text();
+        CHECK(status.find("encoders failed") == std::string::npos,
+              "runtime smoke hot model switch keeps MusicCoCa encoders available");
+        CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 2400),
+              "runtime smoke generated audio after hot model switch");
+
+        const auto loaded_before_bad_reload = processor.loaded_model_path_for_test();
+        const auto bad_reload = unique_temp_dir("pulp-magenta-v2-bad-reload") /
+                                "mrt2_small/mrt2_small.mlxfn";
+        processor.request_model_reload_for_test(bad_reload.string());
+        CHECK(wait_for_runtime_status_containing(processor,
+                                                 output,
+                                                 block_index,
+                                                 "missing or incomplete",
+                                                 240),
+              "runtime smoke reports an incomplete requested model");
+        CHECK(processor.loaded_model_path_for_test() == loaded_before_bad_reload,
+              "runtime smoke keeps the previous model selected after rejected reload");
+        CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 240),
+              "runtime smoke keeps generated audio alive after rejected reload");
+    }
+
     for (int i = 0; i < 32; ++i) {
         process_runtime_block(processor, output, block_index++);
         sleep_for_runtime_block(output);
@@ -372,6 +501,8 @@ int run_generated_runtime_smoke_if_requested() {
 int main() {
     const int registry_result = check_model_registry_defaults();
     if (registry_result != 0) return registry_result;
+    const int active_bundle_result = check_active_model_requires_complete_bundle();
+    if (active_bundle_result != 0) return active_bundle_result;
     const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
     if (status_banner_result != 0) return status_banner_result;
 

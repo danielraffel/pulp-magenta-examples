@@ -20,6 +20,7 @@
 #include "accompanist_native_ui.hpp"
 #include "model_section.hpp"  // the in-editor Models overlay (DAW)
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -62,6 +63,19 @@ public:
     }
 
 private:
+    static pulp::format::SettingsPanel* find_settings_panel(pulp::view::View& view) {
+        if (auto* settings = dynamic_cast<pulp::format::SettingsPanel*>(&view)) return settings;
+        for (std::size_t i = 0; i < view.child_count(); ++i) {
+            if (auto* child = view.child_at(i))
+                if (auto* settings = find_settings_panel(*child)) return settings;
+        }
+        return nullptr;
+    }
+
+    static bool status_targets_models(std::string_view status) {
+        return status.find("Settings > Models") != std::string_view::npos;
+    }
+
     bool model_ready_now() const {
         return model_ready_ && model_ready_();
     }
@@ -107,14 +121,19 @@ private:
     void open_settings(std::string_view settings_tab = {}) {
         for (pulp::view::View* v = parent(); v != nullptr; v = v->parent())
             if (auto* tabs = dynamic_cast<pulp::view::TabPanel*>(v)) {
-                if (!settings_tab.empty() && tabs->tab_count() > 1) {
-                    if (auto* settings =
-                            dynamic_cast<pulp::format::SettingsPanel*>(tabs->child_at(1))) {
-                        settings->set_active_tab(settings_tab);
+                for (std::size_t i = 0; i < tabs->child_count(); ++i) {
+                    auto* child = tabs->child_at(i);
+                    if (!child) continue;
+                    if (auto* settings = find_settings_panel(*child)) {
+                        if (!settings_tab.empty()) settings->set_active_tab(settings_tab);
+                        tabs->set_active_tab(static_cast<int>(i));
+                        return;
                     }
                 }
-                tabs->set_active_tab(1);
-                return;
+                if (settings_tab.empty() && tabs->tab_count() > 1) {
+                    tabs->set_active_tab(1);
+                    return;
+                }
             }
         show_models_ = true;  // DAW: no host chrome — show Models inside the plugin
         rebuild();
@@ -230,14 +249,15 @@ private:
             show_models_overlay();
         else if (ready)
             show_editor();
-        else {
-            last_runtime_status_.clear();
+        else
             show_need_model();
-        }
     }
 
     void show_editor() {
-        add_child(make_top_bar(make_text_button("\xE2\x9A\x99 Settings", [this] { open_settings(); })));
+        add_child(make_top_bar(make_text_button("\xE2\x9A\x99 Settings", [this] {
+            const std::string status = runtime_status_now();
+            open_settings(status_targets_models(status) ? "Models" : "");
+        })));
         const std::string status = runtime_status_now();
         last_runtime_status_ = status;
         if (!status.empty()) add_child(make_status_banner(status));
@@ -255,6 +275,10 @@ private:
     }
 
     void show_need_model() {
+        const std::string status = runtime_status_now();
+        last_runtime_status_ = status;
+        if (!status.empty()) add_child(make_status_banner(status));
+
         auto wrap = std::make_unique<pulp::view::View>();
         wrap->flex().direction = pulp::view::FlexDirection::column;
         wrap->flex().flex_grow = 1.0f;

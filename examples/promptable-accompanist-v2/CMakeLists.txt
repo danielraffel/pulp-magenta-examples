@@ -32,6 +32,9 @@ if(PULP_BUILD_TESTS)
         Pulp::view
         magentart::core
     )
+    target_compile_definitions(promptable-accompanist-v2-test PRIVATE
+        PROMPTABLE_ACCOMPANIST_V2_TESTING=1
+    )
     target_include_directories(promptable-accompanist-v2-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME promptable-accompanist-v2-test COMMAND promptable-accompanist-v2-test)
 endif()

@@ -41,12 +41,14 @@
 #include "model_section.hpp"     // the Models tab V2 contributes to the host Settings
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -59,6 +61,17 @@ inline std::string env_or(const char* key, const std::string& fallback) {
     const char* v = std::getenv(key);
     return (v && *v) ? std::string(v) : fallback;
 }
+
+inline bool magenta_v2_debug_enabled() {
+    const char* v = std::getenv("PULP_MAGENTA_V2_DEBUG");
+    return v && *v && std::string(v) != "0";
+}
+
+inline void magenta_v2_debug_log(const std::string& message) {
+    if (magenta_v2_debug_enabled())
+        std::fprintf(stderr, "[PromptableAccompanistV2] %s\n", message.c_str());
+}
+
 inline std::string default_resources() {
     if (const char* e = std::getenv("MRT2_RESOURCES"); e && *e) return e;
     // Prefer the shared store (~/.pulp/magenta/resources) when the in-plugin overlay
@@ -66,9 +79,13 @@ inline std::string default_resources() {
     // back to the legacy ~/Documents/Magenta layout otherwise.
     if (magenta_demo::shared_resources_complete())
         return magenta_demo::shared_resources_dir().string();
-    return (std::filesystem::path(env_or("HOME", "")) /
-            "Documents/Magenta/magenta-rt-v2/resources").string();
+    return magenta_demo::legacy_resources_dir().string();
 }
+
+inline bool model_bundle_complete(const std::filesystem::path& checkpoint) {
+    return magenta_demo::magenta_model_bundle_complete(checkpoint);
+}
+
 // Resolve the model file. Explicit MRT2_MODEL wins; otherwise prefer the active
 // model selected in Pulp's shared model store. For the legacy ~/Documents/Magenta
 // path, prefer mrt2_small for broad Apple Silicon compatibility; users can still
@@ -86,12 +103,12 @@ inline std::string default_model() {
     if (const std::string active = rt::read_active_model_id(magenta_demo::kMagentaSubsystem);
         !active.empty()) {
         const auto rec = rt::read_installed_model(magenta_demo::kMagentaSubsystem, active);
-        if (rec.checkpoint_exists && !rec.resolved_checkpoint_path.empty()) {
-            const auto& ckpt = rec.resolved_checkpoint_path;
-            const auto state = ckpt.parent_path() / (ckpt.stem().string() + "_state.safetensors");
-            std::error_code ec;
-            if (std::filesystem::exists(state, ec)) return ckpt.string();
-        }
+        magenta_v2_debug_log("active model '" + active + "' resolves to '" +
+                             rec.resolved_checkpoint_path.string() + "'");
+        if (rec.metadata_found && model_bundle_complete(rec.resolved_checkpoint_path))
+            return rec.resolved_checkpoint_path.string();
+        magenta_v2_debug_log("active model '" + active + "' is incomplete");
+        return {};
     }
 
     // Legacy install path (scripts/install-weights.sh). Prefer the small model so a copied
@@ -100,9 +117,22 @@ inline std::string default_model() {
                       "Documents/Magenta/magenta-rt-v2/models";
     const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";
     const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";
-    std::error_code ec;
-    if (std::filesystem::exists(small, ec)) return small.string();
+    if (model_bundle_complete(small)) return small.string();
+    if (model_bundle_complete(base)) return base.string();
     return base.string();
+}
+
+enum class RuntimeIssue : std::uint32_t {
+    none = 0,
+    missing_resources,
+    missing_model_bundle,
+    model_load_failed,
+    encoder_failed,
+    generation_failed,
+};
+
+inline constexpr std::uint32_t issue_value(RuntimeIssue issue) {
+    return static_cast<std::uint32_t>(issue);
 }
 
 // Heap engine state shared between the Processor and its worker thread, so the
@@ -116,8 +146,18 @@ struct EngineState {
     magentart::core::RingBuffer ring_l, ring_r;
     std::atomic<bool> running{true}, loaded{false}, loading{false};
     std::atomic<bool> load_failed{false}, generation_failed{false};
+    std::atomic<std::uint32_t> runtime_issue{issue_value(RuntimeIssue::none)};
     std::atomic<std::uint64_t> generated_frames{0}, underrun_blocks{0};
     std::atomic<float> last_frame_ms{0.0f};
+    std::atomic<float> temperature{1.1f};
+    std::atomic<int> top_k{40};
+    std::atomic<float> cfg_musiccoca{1.0f};
+    std::atomic<float> cfg_notes{1.0f};
+    std::atomic<float> cfg_drums{1.0f};
+    std::array<std::atomic<bool>, 128> desired_notes{};
+    std::array<bool, 128> applied_notes{};
+    std::atomic<std::uint64_t> prompt_revision{1};
+    std::uint64_t applied_prompt_revision = 0;
 
     // Live model hot-reload. MLX makes streams/encoders thread_local, so the
     // model swap MUST run on the worker thread, not in the UI callback that asks
@@ -125,19 +165,21 @@ struct EngineState {
     // services it at a frame boundary (see worker_run). The prompt is mirrored
     // here so it survives a reload (a fresh load_model resets the engine prompt).
     std::atomic<bool> reload_requested{false};
-    std::mutex mutex_;                 // guards pending_model_path + current_prompt
+    std::mutex mutex_;                 // guards pending_model_path/current_prompt/loaded_model_path
     std::string pending_model_path;
     std::string current_prompt;
+    std::string loaded_model_path;
 
     void request_reload(std::string checkpoint_path) {
+        magenta_v2_debug_log("reload requested for '" + checkpoint_path + "'");
         { std::lock_guard<std::mutex> lk(mutex_); pending_model_path = std::move(checkpoint_path); }
         reload_requested.store(true, std::memory_order_release);
     }
-    // Set the text prompt on the engine (safe from any thread — the engine defers
-    // the MLX text-encode to its worker) and remember it for the next reload.
+    // The worker is the only thread that calls MLXEngine. UI/audio threads publish
+    // desired prompt/control state here; worker_run applies it before generation.
     void set_prompt(const std::string& p) {
         { std::lock_guard<std::mutex> lk(mutex_); current_prompt = p; }
-        engine.set_text_prompt(p);
+        prompt_revision.fetch_add(1, std::memory_order_release);
     }
 };
 
@@ -205,15 +247,20 @@ public:
         if (nch == 0 || ns == 0) return;
         if (!st_) { for (std::size_t ch = 0; ch < nch; ++ch) { auto s = out.channel(ch); for (std::size_t i = 0; i < ns; ++i) s[i] = 0.0f; } return; }
 
-        // Push atomic controls + MIDI to the engine (thread-safe from any thread).
-        st_->engine.set_temperature(state().get_value(kTemperature));
-        st_->engine.set_top_k(static_cast<int>(state().get_value(kTopK)));
-        st_->engine.set_cfg_musiccoca(state().get_value(kCfgMusicCoCa));
-        st_->engine.set_cfg_notes(state().get_value(kCfgNotes));
-        st_->engine.set_cfg_drums(state().get_value(kCfgDrums));
+        // Publish desired controls + MIDI for the MLX worker thread. The audio thread
+        // must not call MLXEngine directly while the worker can be loading/reloading.
+        st_->temperature.store(state().get_value(kTemperature), std::memory_order_relaxed);
+        st_->top_k.store(static_cast<int>(state().get_value(kTopK)), std::memory_order_relaxed);
+        st_->cfg_musiccoca.store(state().get_value(kCfgMusicCoCa), std::memory_order_relaxed);
+        st_->cfg_notes.store(state().get_value(kCfgNotes), std::memory_order_relaxed);
+        st_->cfg_drums.store(state().get_value(kCfgDrums), std::memory_order_relaxed);
         for (const auto& ev : midi_in) {
-            if (ev.is_note_on() && ev.velocity() > 0) st_->engine.set_note_on(ev.note());
-            else if (ev.is_note_off() || ev.is_note_on()) st_->engine.set_note_off(ev.note());
+            const int note = ev.note();
+            if (note < 0 || note >= static_cast<int>(st_->desired_notes.size())) continue;
+            if (ev.is_note_on() && ev.velocity() > 0)
+                st_->desired_notes[static_cast<std::size_t>(note)].store(true, std::memory_order_relaxed);
+            else if (ev.is_note_off() || ev.is_note_on())
+                st_->desired_notes[static_cast<std::size_t>(note)].store(false, std::memory_order_relaxed);
         }
 
         // Drain generated 48 kHz stereo from the ring (RT-safe; zero-padded on underrun).
@@ -271,7 +318,13 @@ public:
                 return buf;
             },
             [this](const std::string& p) { if (st_) st_->set_prompt(p); },
-            [] { std::error_code ec; return std::filesystem::exists(default_model(), ec); },  // model_ready
+            [this] {
+                const auto st = st_;
+                if (st && (st->loaded.load(std::memory_order_acquire) ||
+                           st->loading.load(std::memory_order_acquire)))
+                    return true;
+                return model_bundle_complete(default_model());
+            },  // model_ready
             [this] { return runtime_status_text(); },
             // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
             // the newly-activated model from the shared store — it swaps live, no restart. We
@@ -289,6 +342,19 @@ public:
         return freeze_sampler_.status();
     }
 
+#ifdef PROMPTABLE_ACCOMPANIST_V2_TESTING
+    void request_model_reload_for_test(const std::string& checkpoint_path) {
+        if (st_) st_->request_reload(checkpoint_path);
+    }
+
+    std::string loaded_model_path_for_test() {
+        const auto st = st_;
+        if (!st) return {};
+        std::lock_guard<std::mutex> lk(st->mutex_);
+        return st->loaded_model_path;
+    }
+#endif
+
     std::string runtime_status_text() const {
         const auto st = st_;
         if (!st) return {};
@@ -296,9 +362,22 @@ public:
         if (st->loading.load(std::memory_order_acquire))
             return "Loading Magenta model...";
         if (st->generation_failed.load(std::memory_order_acquire))
-            return "Model generation stopped. Open Settings > Models and try redownloading Small.";
-        if (st->load_failed.load(std::memory_order_acquire))
-            return "Model failed to start. Open Settings > Models and try redownloading Small.";
+            return "Model generation stopped. Open Settings > Models to reload or redownload the active model.";
+        if (st->load_failed.load(std::memory_order_acquire)) {
+            switch (static_cast<RuntimeIssue>(st->runtime_issue.load(std::memory_order_acquire))) {
+                case RuntimeIssue::missing_resources:
+                    return "Magenta resources are incomplete. Open Settings > Models to repair the install.";
+                case RuntimeIssue::missing_model_bundle:
+                    return "Model files are missing or incomplete. Open Settings > Models to download or repair a model.";
+                case RuntimeIssue::encoder_failed:
+                    return "Model encoders failed to start. Open Settings > Models to reload or redownload the active model.";
+                case RuntimeIssue::generation_failed:
+                    return "Model generation stopped. Open Settings > Models to reload or redownload the active model.";
+                case RuntimeIssue::model_load_failed:
+                case RuntimeIssue::none:
+                    return "Model failed to start. Open Settings > Models to reload or redownload the active model.";
+            }
+        }
         if (!st->loaded.load(std::memory_order_acquire))
             return {};
 
@@ -308,7 +387,7 @@ public:
 
         const auto underruns = st->underrun_blocks.load(std::memory_order_relaxed);
         if (underruns > 200 && st->ring_l.available() == 0)
-            return "Generated audio is underrunning. Try Small, 48 kHz, and close other GPU-heavy apps.";
+            return "Generated audio is underrunning. Try the Small model, 48 kHz, and close other GPU-heavy apps.";
 
         return {};
     }
@@ -325,6 +404,32 @@ public:
         return sections;
     }
 private:
+    static void apply_realtime_inputs(const std::shared_ptr<EngineState>& st) {
+        st->engine.set_temperature(st->temperature.load(std::memory_order_relaxed));
+        st->engine.set_top_k(st->top_k.load(std::memory_order_relaxed));
+        st->engine.set_cfg_musiccoca(st->cfg_musiccoca.load(std::memory_order_relaxed));
+        st->engine.set_cfg_notes(st->cfg_notes.load(std::memory_order_relaxed));
+        st->engine.set_cfg_drums(st->cfg_drums.load(std::memory_order_relaxed));
+
+        for (std::size_t i = 0; i < st->desired_notes.size(); ++i) {
+            const bool desired = st->desired_notes[i].load(std::memory_order_relaxed);
+            if (desired == st->applied_notes[i]) continue;
+            st->applied_notes[i] = desired;
+            if (desired)
+                st->engine.set_note_on(static_cast<int>(i));
+            else
+                st->engine.set_note_off(static_cast<int>(i));
+        }
+
+        const auto revision = st->prompt_revision.load(std::memory_order_acquire);
+        if (revision != st->applied_prompt_revision) {
+            std::string prompt;
+            { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
+            st->engine.set_text_prompt(prompt);
+            st->applied_prompt_revision = revision;
+        }
+    }
+
     // Load a checkpoint on THIS (worker) thread — required: MLX streams/encoders
     // are thread_local, so load_model must run where generate_frame runs. Returns
     // true once the model + its text/quantizer encoders are ready. Re-applies the
@@ -334,30 +439,65 @@ private:
                             bool assets_ok) {
         using namespace std::chrono_literals;
         magentart::detail::AutoreleasePool pool;
+        const bool had_loaded_model = st->loaded.load(std::memory_order_acquire);
+        auto fail = [&](RuntimeIssue issue, bool keep_current_model) {
+            st->loading.store(false, std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
+            st->runtime_issue.store(issue_value(issue), std::memory_order_release);
+            if (!keep_current_model)
+                st->loaded.store(false, std::memory_order_release);
+            return false;
+        };
         st->loading.store(true, std::memory_order_release);
-        st->loaded.store(false, std::memory_order_release);
         st->load_failed.store(false, std::memory_order_release);
         st->generation_failed.store(false, std::memory_order_release);
+        st->runtime_issue.store(issue_value(RuntimeIssue::none), std::memory_order_release);
         st->generated_frames.store(0, std::memory_order_relaxed);
         st->underrun_blocks.store(0, std::memory_order_relaxed);
-        std::error_code ec;
-        if (!assets_ok || path.empty() || !std::filesystem::exists(path, ec)) {
-            st->loading.store(false, std::memory_order_release);
-            st->load_failed.store(true, std::memory_order_release);
-            return false;
+        if (!assets_ok) {
+            magenta_v2_debug_log("load failed before model load: resources incomplete");
+            return fail(RuntimeIssue::missing_resources, had_loaded_model);
         }
-        if (st->engine.is_loaded()) st->engine.unload();   // swap: drop the old model first
-        if (!st->engine.load_model(path.c_str())) {
-            st->loading.store(false, std::memory_order_release);
-            st->load_failed.store(true, std::memory_order_release);
-            return false;
+        if (path.empty() || !model_bundle_complete(path)) {
+            magenta_v2_debug_log("load failed before model load: bundle incomplete for '" + path + "'");
+            return fail(RuntimeIssue::missing_model_bundle, had_loaded_model);
         }
+
+        bool loaded = false;
+        try {
+            // Do not call MLXEngine::unload() for model switches: it also destroys the
+            // MusicCoCa/TFLite assets loaded by init_assets(), so the next prompt encode
+            // fails even when the new model file itself loads. load_model() already
+            // replaces the transformer state/function.
+            magenta_v2_debug_log("loading model '" + path + "'");
+            loaded = st->engine.load_model(path.c_str());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                         "[PromptableAccompanistV2] MLX model load threw for '%s': %s\n",
+                         path.c_str(), e.what());
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[PromptableAccompanistV2] MLX model load threw for '%s'.\n",
+                         path.c_str());
+        }
+        if (!loaded) {
+            magenta_v2_debug_log("MLXEngine::load_model returned false for '" + path + "'");
+            return fail(RuntimeIssue::model_load_failed, false);
+        }
+
         std::string prompt;
         { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
         st->engine.set_text_prompt(prompt);
+        st->applied_prompt_revision = st->prompt_revision.load(std::memory_order_acquire);
         while (st->running.load() &&
                (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
             std::this_thread::sleep_for(10ms);
+        if (st->engine.get_text_encoder_status() == 3 || st->engine.get_quantizer_status() == 3) {
+            magenta_v2_debug_log("encoder failed after model load for '" + path + "'");
+            return fail(RuntimeIssue::encoder_failed, false);
+        }
+        { std::lock_guard<std::mutex> lk(st->mutex_); st->loaded_model_path = path; }
+        magenta_v2_debug_log("model load complete for '" + path + "'");
         st->loading.store(false, std::memory_order_release);
         return true;
     }
@@ -368,10 +508,13 @@ private:
         namespace mc = magentart::core;
         {
             magentart::detail::AutoreleasePool pool;
+            apply_realtime_inputs(st);
             const auto start = std::chrono::steady_clock::now();
             if (!st->engine.generate_frame(L, R)) {
                 st->generation_failed.store(true, std::memory_order_release);
                 st->load_failed.store(true, std::memory_order_release);
+                st->runtime_issue.store(issue_value(RuntimeIssue::generation_failed),
+                                        std::memory_order_release);
                 return false;
             }
             const auto end = std::chrono::steady_clock::now();
@@ -392,6 +535,8 @@ private:
             !st->ring_r.write(R, mc::kFrameSamples)) {
             st->generation_failed.store(true, std::memory_order_release);
             st->load_failed.store(true, std::memory_order_release);
+            st->runtime_issue.store(issue_value(RuntimeIssue::generation_failed),
+                                    std::memory_order_release);
             return false;
         }
         st->generated_frames.fetch_add(1, std::memory_order_relaxed);
@@ -406,24 +551,39 @@ private:
         return true;
     }
 
+    static bool init_assets(const std::shared_ptr<EngineState>& st) {
+        magentart::detail::AutoreleasePool pool;
+        bool ok = false;
+        const std::string resources = default_resources();
+        try {
+            ok = st->engine.init_assets(resources.c_str(), "musiccoca");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                         "[PromptableAccompanistV2] MRT2 init_assets threw for '%s': %s\n",
+                         resources.c_str(), e.what());
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[PromptableAccompanistV2] MRT2 init_assets threw for '%s'.\n",
+                         resources.c_str());
+        }
+        if (!ok)
+            std::fprintf(stderr, "[PromptableAccompanistV2] MRT2 shared resources not found at:\n"
+                                 "    %s\n  The instrument stays silent until they are installed.\n",
+                         resources.c_str());
+        return ok;
+    }
+
     static void worker_run(std::shared_ptr<EngineState> st) {
         using namespace std::chrono_literals;
         namespace mc = magentart::core;
 
-        bool assets_ok = false;
-        {
-            magentart::detail::AutoreleasePool pool;
-            assets_ok = st->engine.init_assets(default_resources().c_str(), "musiccoca");
-        }
-        if (!assets_ok)
-            std::fprintf(stderr, "[PromptableAccompanistV2] MRT2 shared resources not found at:\n"
-                                 "    %s\n  The instrument stays silent until they are installed.\n",
-                         default_resources().c_str());
+        bool assets_ok = init_assets(st);
 
         // Initial load. Unlike before, a missing model is NOT fatal — the worker idles
         // and keeps servicing reload requests, so a model downloaded later from the
         // in-plugin Models overlay starts playing live, with no restart.
         const std::string initial = default_model();
+        magenta_v2_debug_log("initial model resolved to '" + initial + "'");
         std::error_code ec;
         if (assets_ok && !std::filesystem::exists(initial, ec))
             std::fprintf(stderr,
@@ -439,18 +599,41 @@ private:
             // Service a hot-reload at a frame boundary (on this MLX-owning thread).
             if (st->reload_requested.exchange(false, std::memory_order_acquire)) {
                 std::string path;
-                { std::lock_guard<std::mutex> lk(st->mutex_); path = st->pending_model_path; }
+                std::string loaded_path;
+                {
+                    std::lock_guard<std::mutex> lk(st->mutex_);
+                    path = st->pending_model_path;
+                    loaded_path = st->loaded_model_path;
+                }
+                if (st->loaded.load(std::memory_order_acquire) && !path.empty() &&
+                    path == loaded_path) {
+                    magenta_v2_debug_log("reload skipped; requested model is already loaded: '" +
+                                         path + "'");
+                    st->loading.store(false, std::memory_order_release);
+                    st->load_failed.store(false, std::memory_order_release);
+                    st->generation_failed.store(false, std::memory_order_release);
+                    st->runtime_issue.store(issue_value(RuntimeIssue::none),
+                                            std::memory_order_release);
+                    continue;
+                }
+                if (!assets_ok) assets_ok = init_assets(st);
                 const bool rok_load = worker_load(st, path, assets_ok);
                 bool rok = rok_load;
                 if (rok) rok = prime_output_ring(st, L, R);
-                st->loaded.store(rok, std::memory_order_release);
-                st->load_failed.store(!rok, std::memory_order_release);
+                if (rok) {
+                    st->loaded.store(true, std::memory_order_release);
+                    st->load_failed.store(false, std::memory_order_release);
+                } else if (rok_load) {
+                    st->loaded.store(false, std::memory_order_release);
+                    st->load_failed.store(true, std::memory_order_release);
+                }
             }
             if (!st->loaded.load()) {               // no model yet → idle, stay responsive
                 std::this_thread::sleep_for(20ms);
                 continue;
             }
             if (!generate_and_write_frame(st, L, R)) {
+                if (!st->running.load(std::memory_order_relaxed)) break;
                 st->loaded.store(false, std::memory_order_release);
                 std::fprintf(stderr,
                              "[PromptableAccompanistV2] MRT2 generation stopped; "

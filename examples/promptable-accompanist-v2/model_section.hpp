@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -42,8 +43,32 @@ public:
     }
 
 private:
+    static pulp::runtime::ModelListResult list_magenta_models() {
+        auto result = pulp::runtime::list_models(magenta_models(), kMagentaSubsystem);
+        const bool resources_ok = runtime_resources_complete();
+        for (auto& listed : result.models) {
+            if (listed.status != "installed") continue;
+            if (!resources_ok ||
+                !magenta_model_bundle_complete(listed.resolved_checkpoint_path)) {
+                // Older one-file installs, interrupted resource downloads, or copied metadata
+                // are not loadable by MRT2. Surface them as resumable repairs instead of
+                // showing "Installed" and letting the engine fail at runtime.
+                listed.status = "partial";
+                listed.partial_fraction = 0.0f;
+            }
+        }
+        return result;
+    }
+
+    static bool active_model_complete(const std::string& id) {
+        if (id.empty()) return false;
+        const auto rec = pulp::runtime::read_installed_model(kMagentaSubsystem, id);
+        return rec.metadata_found && runtime_resources_complete() &&
+               magenta_model_bundle_complete(rec.resolved_checkpoint_path);
+    }
+
     void refresh_list() {
-        if (manager_) manager_->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
+        if (manager_) manager_->set_models(list_magenta_models());
     }
 
     void build() {
@@ -63,7 +88,7 @@ private:
         };
         mgr->on_cancel = [this](const std::string&) { cancel_.cancel(); };
         manager_ = mgr.get();
-        mgr->set_models(pulp::runtime::list_models(magenta_models(), kMagentaSubsystem));
+        mgr->set_models(list_magenta_models());
         mgr->set_can_close(false);  // the host Settings panel owns navigation
         if (downloading_.load()) mgr->set_download_progress(active_dl_id_, progress_.load());
         add_child(std::move(mgr));
@@ -79,8 +104,11 @@ private:
             if (worker_.joinable()) worker_.join();
             if (manager_) manager_->set_download_progress(active_dl_id_, -1.0f);
             if (success_.load()) {
-                // First downloaded model auto-becomes the default.
-                if (pulp::runtime::read_active_model_id(kMagentaSubsystem).empty())
+                // First downloaded model auto-becomes the default. If this was repairing the
+                // currently-active model, rewrite the active state too so stale metadata is
+                // refreshed after old one-file installs.
+                const auto active = pulp::runtime::read_active_model_id(kMagentaSubsystem);
+                if (active.empty() || active == active_dl_id_ || !active_model_complete(active))
                     pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
                 if (on_model_changed_) on_model_changed_();
             }
