@@ -4,6 +4,7 @@ description: Bring Magenta RealTime 2 into a Pulp project and build/validate the
 requires:
   scripts:
     - scripts/install-weights.sh
+    - scripts/smoke-v2-hot-reload.sh
     - magentart-wrapper/CMakeLists.txt
     - tools/packages/registry.json
 ---
@@ -35,6 +36,20 @@ pulp add magenta-realtime-2
 pulp build
 pulp validate            # auval / clap-validator on the built formats
 ```
+
+## Promptable Accompanist V2 hot-reload validation
+
+For any change touching V2 model loading, model downloads, resource detection, prompt encoding,
+audio continuity, or freeze-loop behavior, run the codified Release smoke:
+
+```bash
+./scripts/smoke-v2-hot-reload.sh
+```
+
+This verifies Release config/flags, builds the V2 test and standalone, runs the normal contract,
+then runs the real-model smoke (`PULP_MAGENTA_V2_RUN_MODEL_SMOKE=1`) that checks generated audio,
+freeze/release, hot-switch to another installed model, and rejected incomplete-model reloads that
+must preserve the previous model and audible output.
 
 ## Gotchas (validated)
 

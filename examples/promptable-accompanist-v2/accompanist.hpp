@@ -135,6 +135,12 @@ inline constexpr std::uint32_t issue_value(RuntimeIssue issue) {
     return static_cast<std::uint32_t>(issue);
 }
 
+enum class WorkerLoadOutcome {
+    loaded,
+    preserved_current_model,
+    failed,
+};
+
 // Heap engine state shared between the Processor and its worker thread, so the
 // Processor can be destroyed INSTANTLY (detach, no join) even while the worker is
 // mid-model-load. The worker holds a shared_ptr ref, finishes its current op,
@@ -431,12 +437,14 @@ private:
     }
 
     // Load a checkpoint on THIS (worker) thread — required: MLX streams/encoders
-    // are thread_local, so load_model must run where generate_frame runs. Returns
-    // true once the model + its text/quantizer encoders are ready. Re-applies the
-    // remembered prompt so a hot-reload doesn't drop it. assets_ok gates the very
-    // first init_assets (resources are shared and loaded once).
-    static bool worker_load(const std::shared_ptr<EngineState>& st, const std::string& path,
-                            bool assets_ok) {
+    // are thread_local, so load_model must run where generate_frame runs. The
+    // outcome distinguishes destructive failures from rejected reload requests:
+    // incomplete resources/bundles should preserve the currently loaded model.
+    // Re-applies the remembered prompt so a hot-reload doesn't drop it. assets_ok
+    // gates the very first init_assets (resources are shared and loaded once).
+    static WorkerLoadOutcome worker_load(const std::shared_ptr<EngineState>& st,
+                                         const std::string& path,
+                                         bool assets_ok) {
         using namespace std::chrono_literals;
         magentart::detail::AutoreleasePool pool;
         const bool had_loaded_model = st->loaded.load(std::memory_order_acquire);
@@ -446,7 +454,8 @@ private:
             st->runtime_issue.store(issue_value(issue), std::memory_order_release);
             if (!keep_current_model)
                 st->loaded.store(false, std::memory_order_release);
-            return false;
+            return keep_current_model ? WorkerLoadOutcome::preserved_current_model
+                                      : WorkerLoadOutcome::failed;
         };
         st->loading.store(true, std::memory_order_release);
         st->load_failed.store(false, std::memory_order_release);
@@ -499,7 +508,7 @@ private:
         { std::lock_guard<std::mutex> lk(st->mutex_); st->loaded_model_path = path; }
         magenta_v2_debug_log("model load complete for '" + path + "'");
         st->loading.store(false, std::memory_order_release);
-        return true;
+        return WorkerLoadOutcome::loaded;
     }
 
     static bool generate_and_write_frame(const std::shared_ptr<EngineState>& st,
@@ -590,7 +599,7 @@ private:
                 "[PromptableAccompanistV2] No MRT2 model installed yet. Open Settings -> Models to\n"
                 "  download one (mrt2_small or mrt2_base) — it will start playing without a restart.\n");
         float L[mc::kFrameSamples], R[mc::kFrameSamples];
-        bool ok = worker_load(st, initial, assets_ok);
+        bool ok = worker_load(st, initial, assets_ok) == WorkerLoadOutcome::loaded;
         if (ok) ok = prime_output_ring(st, L, R);
         st->loaded.store(ok, std::memory_order_release);
         st->load_failed.store(!ok, std::memory_order_release);
@@ -617,13 +626,12 @@ private:
                     continue;
                 }
                 if (!assets_ok) assets_ok = init_assets(st);
-                const bool rok_load = worker_load(st, path, assets_ok);
-                bool rok = rok_load;
-                if (rok) rok = prime_output_ring(st, L, R);
-                if (rok) {
+                const WorkerLoadOutcome load_outcome = worker_load(st, path, assets_ok);
+                if (load_outcome == WorkerLoadOutcome::loaded &&
+                    prime_output_ring(st, L, R)) {
                     st->loaded.store(true, std::memory_order_release);
                     st->load_failed.store(false, std::memory_order_release);
-                } else if (rok_load) {
+                } else if (load_outcome == WorkerLoadOutcome::loaded) {
                     st->loaded.store(false, std::memory_order_release);
                     st->load_failed.store(true, std::memory_order_release);
                 }
