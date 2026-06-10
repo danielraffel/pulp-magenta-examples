@@ -67,6 +67,10 @@ must preserve the previous model and audible output.
 - During hot reload, keep the previous model/audio ring alive until the replacement model is fully
   loaded, encoded, and primed. If a requested model bundle or resource set is incomplete, report
   that status but preserve the current loaded model so generated audio continues.
+- Treat the active model id as a preference, not proof of a loadable model. Before every reload,
+  resolve a complete and hardware-compatible bundle; stale active metadata, deleted models,
+  partial downloads, and M1-family `mrt2_base` selections must fall back to Small or show the
+  download-model gate before MLX gets a path.
 - Treat a cleared prompt as **masked MusicCoCa tokens**, not `set_text_prompt("")`. Empty text can
   still be encoded as a prompt/fallback in Magenta; the masked-token API is the deliberate
   no-text-conditioning path. Debounce live prompt edits so replacing text (`cello` -> `violin`)

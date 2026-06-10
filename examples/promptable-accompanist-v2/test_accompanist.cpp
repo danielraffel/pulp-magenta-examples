@@ -73,6 +73,30 @@ void write_text_file(const std::filesystem::path& path, const std::string& text)
     file << text;
 }
 
+void write_installed_model_metadata(const std::filesystem::path& pulp_home,
+                                    const std::string& model_id,
+                                    const std::filesystem::path& checkpoint) {
+    write_text_file(pulp_home / "magenta/models" / (model_id + ".json"),
+                    "{\n"
+                    "  \"model_id\": \"" + model_id + "\",\n"
+                    "  \"backend\": \"mlx\",\n"
+                    "  \"checkpoint_ref\": \"hf://google/magenta-realtime-2/models/" +
+                        model_id + "/" + model_id + ".mlxfn\",\n"
+                    "  \"resolved_checkpoint_path\": \"" + checkpoint.string() + "\"\n"
+                    "}\n");
+}
+
+void write_active_model_state(const std::filesystem::path& pulp_home,
+                              const std::string& model_id,
+                              const std::filesystem::path& checkpoint) {
+    write_text_file(pulp_home / "magenta/model-state.json",
+                    "{\n"
+                    "  \"active_model_id\": \"" + model_id + "\",\n"
+                    "  \"configured_model_id\": \"" + model_id + "\",\n"
+                    "  \"resolved_checkpoint_path\": \"" + checkpoint.string() + "\"\n"
+                    "}\n");
+}
+
 void fill_test_audio(pulp::audio::Buffer<float>& block, int block_index) {
     constexpr double kTwoPi = 6.28318530717958647692;
     for (std::size_t ch = 0; ch < block.num_channels(); ++ch) {
@@ -244,6 +268,8 @@ int check_model_registry_defaults() {
     EnvGuard home_guard("HOME", home.c_str());
     EnvGuard pulp_home_guard("PULP_HOME", nullptr);
     EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+    EnvGuard hardware_guard("PULP_MAGENTA_V2_HW_MODEL", "Mac16,1");
+    EnvGuard unsupported_guard("PULP_MAGENTA_V2_ALLOW_UNSUPPORTED_MODEL", nullptr);
 
     const auto root = home / "Documents/Magenta/magenta-rt-v2/models";
     const auto small = root / "mrt2_small/mrt2_small.mlxfn";
@@ -256,6 +282,16 @@ int check_model_registry_defaults() {
 
     std::filesystem::remove(small);
     CHECK(default_model() == base.string(), "legacy resolver falls back to base when small is absent");
+
+    touch_model_file(small);
+    {
+        EnvGuard m1_guard("PULP_MAGENTA_V2_HW_MODEL", "MacBookPro18,4");
+        CHECK(default_model() == small.string(),
+              "M1 resolver still uses a complete legacy small model");
+        std::filesystem::remove(small);
+        CHECK(default_model().empty(),
+              "M1 resolver refuses legacy base when small is absent");
+    }
     std::filesystem::remove_all(home);
     return 0;
 }
@@ -266,29 +302,20 @@ int check_active_model_requires_complete_bundle() {
     EnvGuard home_guard("HOME", legacy_home.c_str());
     EnvGuard pulp_home_guard("PULP_HOME", home.c_str());
     EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+    EnvGuard hardware_guard("PULP_MAGENTA_V2_HW_MODEL", "Mac16,1");
+    EnvGuard unsupported_guard("PULP_MAGENTA_V2_ALLOW_UNSUPPORTED_MODEL", nullptr);
 
     const auto shared = home / "magenta/models/mrt2_small/mrt2_small.mlxfn";
     touch_model_file(shared);
-    write_text_file(home / "magenta/models/mrt2_small.json",
-                    "{\n"
-                    "  \"model_id\": \"mrt2_small\",\n"
-                    "  \"backend\": \"mlx\",\n"
-                    "  \"checkpoint_ref\": \"hf://google/magenta-realtime-2/models/mrt2_small/mrt2_small.mlxfn\",\n"
-                    "  \"resolved_checkpoint_path\": \"" + shared.string() + "\"\n"
-                    "}\n");
-    write_text_file(home / "magenta/model-state.json",
-                    "{\n"
-                    "  \"active_model_id\": \"mrt2_small\",\n"
-                    "  \"configured_model_id\": \"mrt2_small\",\n"
-                    "  \"resolved_checkpoint_path\": \"" + shared.string() + "\"\n"
-                    "}\n");
+    write_installed_model_metadata(home, "mrt2_small", shared);
+    write_active_model_state(home, "mrt2_small", shared);
 
     const auto legacy_root = legacy_home / "Documents/Magenta/magenta-rt-v2/models";
     const auto legacy_small = legacy_root / "mrt2_small/mrt2_small.mlxfn";
     touch_model_file(legacy_small);
     touch_model_file(legacy_root / "mrt2_small/mrt2_small_state.safetensors");
-    CHECK(default_model().empty(),
-          "incomplete active shared model does not silently fall back to a legacy model");
+    CHECK(default_model() == legacy_small.string(),
+          "incomplete active shared model falls back to a complete compatible local model");
 
     touch_model_file(home / "magenta/models/mrt2_small/mrt2_small_state.safetensors");
     CHECK(default_model() == shared.string(),
@@ -296,6 +323,69 @@ int check_active_model_requires_complete_bundle() {
 
     std::filesystem::remove_all(home);
     std::filesystem::remove_all(legacy_home);
+    return 0;
+}
+
+int check_m1_resolver_avoids_large_model() {
+    const auto home = unique_temp_dir("pulp-magenta-v2-m1-large");
+    const auto legacy_home = unique_temp_dir("pulp-magenta-v2-m1-large-legacy");
+    EnvGuard home_guard("HOME", legacy_home.c_str());
+    EnvGuard pulp_home_guard("PULP_HOME", home.c_str());
+    EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+    EnvGuard hardware_guard("PULP_MAGENTA_V2_HW_MODEL", "MacBookPro18,4");
+    EnvGuard unsupported_guard("PULP_MAGENTA_V2_ALLOW_UNSUPPORTED_MODEL", nullptr);
+
+    const auto shared_base = home / "magenta/models/mrt2_base/mrt2_base.mlxfn";
+    touch_model_file(shared_base);
+    touch_model_file(home / "magenta/models/mrt2_base/mrt2_base_state.safetensors");
+    write_installed_model_metadata(home, "mrt2_base", shared_base);
+    write_active_model_state(home, "mrt2_base", shared_base);
+    CHECK(default_model().empty(),
+          "M1 resolver refuses active shared large model when no small fallback exists");
+
+    const auto shared_small = home / "magenta/models/mrt2_small/mrt2_small.mlxfn";
+    touch_model_file(shared_small);
+    touch_model_file(home / "magenta/models/mrt2_small/mrt2_small_state.safetensors");
+    write_installed_model_metadata(home, "mrt2_small", shared_small);
+    CHECK(default_model() == shared_small.string(),
+          "M1 resolver falls back from active large to shared small");
+
+    {
+        EnvGuard non_m1_guard("PULP_MAGENTA_V2_HW_MODEL", "Mac16,1");
+        CHECK(default_model() == shared_base.string(),
+              "non-M1 resolver preserves an active complete large model");
+    }
+
+    std::filesystem::remove_all(home);
+    std::filesystem::remove_all(legacy_home);
+    return 0;
+}
+
+int check_runtime_status_priority() {
+    Processor processor;
+    processor.force_runtime_flags_for_test(true,
+                                           true,
+                                           false,
+                                           RuntimeIssue::none,
+                                           4);
+    CHECK(processor.runtime_status_text().empty(),
+          "generated audio state clears stale loading status");
+
+    processor.force_runtime_flags_for_test(false,
+                                           true,
+                                           true,
+                                           RuntimeIssue::missing_model_bundle,
+                                           0);
+    CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
+          "missing local model status tells the user to download a model");
+
+    processor.force_runtime_flags_for_test(false,
+                                           true,
+                                           true,
+                                           RuntimeIssue::unsupported_model,
+                                           0);
+    CHECK(processor.runtime_status_text().find("Small model") != std::string::npos,
+          "unsupported real-time model status points users to Small");
     return 0;
 }
 
@@ -556,6 +646,10 @@ int main() {
     if (registry_result != 0) return registry_result;
     const int active_bundle_result = check_active_model_requires_complete_bundle();
     if (active_bundle_result != 0) return active_bundle_result;
+    const int m1_resolver_result = check_m1_resolver_avoids_large_model();
+    if (m1_resolver_result != 0) return m1_resolver_result;
+    const int runtime_status_result = check_runtime_status_priority();
+    if (runtime_status_result != 0) return runtime_status_result;
     const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
     if (status_banner_result != 0) return status_banner_result;
     const int prompt_clear_result = check_prompt_clear_contract();

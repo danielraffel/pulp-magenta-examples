@@ -57,6 +57,10 @@
 #include <string_view>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace pulp::examples::accompanist_v2 {
 
 inline std::string env_or(const char* key, const std::string& fallback) {
@@ -113,12 +117,95 @@ inline bool model_bundle_complete(const std::filesystem::path& checkpoint) {
     return magenta_demo::magenta_model_bundle_complete(checkpoint);
 }
 
+inline bool env_truthy(const char* key) {
+    const char* v = std::getenv(key);
+    return v && *v && std::string(v) != "0";
+}
+
+inline bool starts_with(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
+inline std::string host_hardware_model() {
+    if (const char* override = std::getenv("PULP_MAGENTA_V2_HW_MODEL"); override && *override)
+        return override;
+#if defined(__APPLE__)
+    char model[256]{};
+    std::size_t size = sizeof(model);
+    if (sysctlbyname("hw.model", model, &size, nullptr, 0) == 0 && size > 0) {
+        if (model[size - 1] == '\0') --size;
+        return std::string(model, size);
+    }
+#endif
+    return {};
+}
+
+inline bool host_is_m1_family() {
+    const std::string model = host_hardware_model();
+    return starts_with(model, "MacBookAir10,") ||
+           starts_with(model, "MacBookPro17,") ||
+           starts_with(model, "MacBookPro18,") ||
+           starts_with(model, "Macmini9,") ||
+           starts_with(model, "iMac21,") ||
+           starts_with(model, "Mac13,");
+}
+
+inline std::string magenta_model_id_from_path(const std::filesystem::path& checkpoint) {
+    const std::string generic = checkpoint.generic_string();
+    if (generic.find("mrt2_base") != std::string::npos) return "mrt2_base";
+    if (generic.find("mrt2_small") != std::string::npos) return "mrt2_small";
+    return checkpoint.stem().string();
+}
+
+inline bool model_supported_for_realtime_host(const std::filesystem::path& checkpoint) {
+    if (env_truthy("PULP_MAGENTA_V2_ALLOW_UNSUPPORTED_MODEL")) return true;
+    const std::string model_id = magenta_model_id_from_path(checkpoint);
+    if (model_id != "mrt2_base") return true;
+    // Magenta's real-time device table says mrt2_base is not supported on M1 Pro/Air.
+    // The M1 crash reports show MLX can abort during load, so block it before MLX sees it.
+    return !host_is_m1_family();
+}
+
+inline bool model_bundle_usable(const std::filesystem::path& checkpoint) {
+    return model_bundle_complete(checkpoint) && model_supported_for_realtime_host(checkpoint);
+}
+
+inline std::string complete_shared_model_path(const std::string& model_id) {
+    namespace rt = pulp::runtime;
+    const auto rec = rt::read_installed_model(magenta_demo::kMagentaSubsystem, model_id);
+    if (!rec.metadata_found) return {};
+    if (!model_bundle_complete(rec.resolved_checkpoint_path)) {
+        magenta_v2_debug_log("shared model '" + model_id + "' is incomplete");
+        return {};
+    }
+    if (!model_supported_for_realtime_host(rec.resolved_checkpoint_path)) {
+        magenta_v2_debug_log("shared model '" + model_id + "' is not supported on this Mac");
+        return {};
+    }
+    return rec.resolved_checkpoint_path.string();
+}
+
+inline std::string complete_legacy_model_path(const std::filesystem::path& checkpoint) {
+    if (!model_bundle_complete(checkpoint)) return {};
+    if (!model_supported_for_realtime_host(checkpoint)) {
+        magenta_v2_debug_log("legacy model '" + checkpoint.string() + "' is not supported on this Mac");
+        return {};
+    }
+    return checkpoint.string();
+}
+
 // Resolve the model file. Explicit MRT2_MODEL wins; otherwise prefer the active
 // model selected in Pulp's shared model store. For the legacy ~/Documents/Magenta
 // path, prefer mrt2_small for broad Apple Silicon compatibility; users can still
 // opt into mrt2_base explicitly from the Models tab.
 inline std::string default_model() {
-    if (const char* e = std::getenv("MRT2_MODEL"); e && *e) return e;
+    if (const char* e = std::getenv("MRT2_MODEL"); e && *e) {
+        const std::filesystem::path explicit_path(e);
+        if (model_bundle_usable(explicit_path)) return explicit_path.string();
+        magenta_v2_debug_log("explicit MRT2_MODEL is not complete or supported: '" +
+                             explicit_path.string() + "'");
+        return {};
+    }
 
     // Prefer a model installed through the in-plugin / standalone Models overlay — i.e. the
     // shared Pulp model store at ~/.pulp/magenta. That is what a plugin-only install
@@ -132,11 +219,15 @@ inline std::string default_model() {
         const auto rec = rt::read_installed_model(magenta_demo::kMagentaSubsystem, active);
         magenta_v2_debug_log("active model '" + active + "' resolves to '" +
                              rec.resolved_checkpoint_path.string() + "'");
-        if (rec.metadata_found && model_bundle_complete(rec.resolved_checkpoint_path))
+        if (rec.metadata_found && model_bundle_usable(rec.resolved_checkpoint_path))
             return rec.resolved_checkpoint_path.string();
-        magenta_v2_debug_log("active model '" + active + "' is incomplete");
-        return {};
+        magenta_v2_debug_log("active model '" + active + "' is incomplete or unsupported");
     }
+
+    if (auto shared_small = complete_shared_model_path("mrt2_small"); !shared_small.empty())
+        return shared_small;
+    if (auto shared_base = complete_shared_model_path("mrt2_base"); !shared_base.empty())
+        return shared_base;
 
     // Legacy install path (scripts/install-weights.sh). Prefer the small model so a copied
     // app defaults to the most compatible complete checkpoint on M1-class machines.
@@ -144,15 +235,18 @@ inline std::string default_model() {
                       "Documents/Magenta/magenta-rt-v2/models";
     const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";
     const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";
-    if (model_bundle_complete(small)) return small.string();
-    if (model_bundle_complete(base)) return base.string();
-    return base.string();
+    if (auto legacy_small = complete_legacy_model_path(small); !legacy_small.empty())
+        return legacy_small;
+    if (auto legacy_base = complete_legacy_model_path(base); !legacy_base.empty())
+        return legacy_base;
+    return {};
 }
 
 enum class RuntimeIssue : std::uint32_t {
     none = 0,
     missing_resources,
     missing_model_bundle,
+    unsupported_model,
     model_load_failed,
     encoder_failed,
     generation_failed,
@@ -208,6 +302,23 @@ struct EngineState {
         magenta_v2_debug_log("reload requested for '" + checkpoint_path + "'");
         { std::lock_guard<std::mutex> lk(mutex_); pending_model_path = std::move(checkpoint_path); }
         reload_requested.store(true, std::memory_order_release);
+    }
+
+    void clear_loaded_model(RuntimeIssue issue = RuntimeIssue::missing_model_bundle) {
+        magenta_v2_debug_log("clearing loaded model state");
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            pending_model_path.clear();
+            loaded_model_path.clear();
+        }
+        reload_requested.store(false, std::memory_order_release);
+        loading.store(false, std::memory_order_release);
+        loaded.store(false, std::memory_order_release);
+        load_failed.store(true, std::memory_order_release);
+        generation_failed.store(false, std::memory_order_release);
+        runtime_issue.store(issue_value(issue), std::memory_order_release);
+        generated_frames.store(0, std::memory_order_relaxed);
+        underrun_blocks.store(0, std::memory_order_relaxed);
     }
     // The worker is the only thread that calls MLXEngine. UI/audio threads publish
     // desired prompt/control state here; worker_run applies it before generation.
@@ -359,17 +470,22 @@ public:
             [this](const std::string& p) { if (st_) st_->set_prompt(p); },
             [this] {
                 const auto st = st_;
-                if (st && (st->loaded.load(std::memory_order_acquire) ||
-                           st->loading.load(std::memory_order_acquire)))
+                if (st && st->loading.load(std::memory_order_acquire))
                     return true;
-                return model_bundle_complete(default_model());
+                if (st && st->loaded.load(std::memory_order_acquire)) {
+                    std::string loaded_path;
+                    { std::lock_guard<std::mutex> lk(st->mutex_); loaded_path = st->loaded_model_path; }
+                    if (!loaded_path.empty() && model_bundle_usable(loaded_path))
+                        return true;
+                }
+                return !default_model().empty();
             },  // model_ready
             [this] { return runtime_status_text(); },
             // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
             // the newly-activated model from the shared store — it swaps live, no restart. We
             // must NOT rebuild the editor here (that would destroy the ModelSection mid-callback);
             // the overlay's Done button refreshes the editor safely.
-            [this] { if (st_) st_->request_reload(default_model()); },
+            [this] { request_reload_to_default_model(); },
             current_prompt_for_view());
         editor_ = editor.get();
         return editor;
@@ -403,14 +519,28 @@ public:
         return st->applied_prompt_revision.load(std::memory_order_acquire) ==
                st->prompt_revision.load(std::memory_order_acquire);
     }
+
+    void force_runtime_flags_for_test(bool loaded,
+                                      bool loading,
+                                      bool load_failed,
+                                      RuntimeIssue issue,
+                                      std::uint64_t generated_frames) {
+        if (!st_) st_ = std::make_shared<EngineState>();
+        st_->loaded.store(loaded, std::memory_order_release);
+        st_->loading.store(loading, std::memory_order_release);
+        st_->load_failed.store(load_failed, std::memory_order_release);
+        st_->generation_failed.store(issue == RuntimeIssue::generation_failed,
+                                     std::memory_order_release);
+        st_->runtime_issue.store(issue_value(issue), std::memory_order_release);
+        st_->generated_frames.store(generated_frames, std::memory_order_relaxed);
+    }
 #endif
 
     std::string runtime_status_text() const {
         const auto st = st_;
         if (!st) return {};
 
-        if (st->loading.load(std::memory_order_acquire))
-            return "Loading Magenta model...";
+        const bool loaded = st->loaded.load(std::memory_order_acquire);
         if (st->generation_failed.load(std::memory_order_acquire))
             return "Model generation stopped. Open Settings > Models to reload or redownload the active model.";
         if (st->load_failed.load(std::memory_order_acquire)) {
@@ -418,7 +548,11 @@ public:
                 case RuntimeIssue::missing_resources:
                     return "Magenta resources are incomplete. Open Settings > Models to repair the install.";
                 case RuntimeIssue::missing_model_bundle:
-                    return "Model files are missing or incomplete. Open Settings > Models to download or repair a model.";
+                    if (loaded)
+                        return "Model files are missing or incomplete. Open Settings > Models to download or repair a model.";
+                    return "Download a model in Settings > Models to start generating audio.";
+                case RuntimeIssue::unsupported_model:
+                    return "This Mac can run the Small model in real time. Open Settings > Models to download or select Small.";
                 case RuntimeIssue::encoder_failed:
                     return "Model encoders failed to start. Open Settings > Models to reload or redownload the active model.";
                 case RuntimeIssue::generation_failed:
@@ -428,8 +562,11 @@ public:
                     return "Model failed to start. Open Settings > Models to reload or redownload the active model.";
             }
         }
-        if (!st->loaded.load(std::memory_order_acquire))
+        if (!loaded) {
+            if (st->loading.load(std::memory_order_acquire))
+                return "Loading Magenta model...";
             return {};
+        }
 
         const auto generated = st->generated_frames.load(std::memory_order_relaxed);
         if (generated < 3)
@@ -448,12 +585,23 @@ public:
         std::vector<format::Processor::SettingsSection> sections;
         sections.push_back({"Models", std::make_unique<magenta_demo::ModelSection>(
                                           [this] {
-                                              if (st_) st_->request_reload(default_model());  // swap live
+                                              request_reload_to_default_model();  // swap live
                                               if (editor_) editor_->refresh();
                                           })});
         return sections;
     }
 private:
+    void request_reload_to_default_model() {
+        if (!st_) return;
+        const auto path = default_model();
+        if (path.empty()) {
+            st_->clear_loaded_model(RuntimeIssue::missing_model_bundle);
+            if (editor_) editor_->refresh();
+            return;
+        }
+        st_->request_reload(path);
+    }
+
     std::string current_prompt_for_view() const {
         const auto st = st_;
         if (!st) return default_prompt();
@@ -519,8 +667,6 @@ private:
         st->load_failed.store(false, std::memory_order_release);
         st->generation_failed.store(false, std::memory_order_release);
         st->runtime_issue.store(issue_value(RuntimeIssue::none), std::memory_order_release);
-        st->generated_frames.store(0, std::memory_order_relaxed);
-        st->underrun_blocks.store(0, std::memory_order_relaxed);
         if (!assets_ok) {
             magenta_v2_debug_log("load failed before model load: resources incomplete");
             return fail(RuntimeIssue::missing_resources, had_loaded_model);
@@ -528,6 +674,11 @@ private:
         if (path.empty() || !model_bundle_complete(path)) {
             magenta_v2_debug_log("load failed before model load: bundle incomplete for '" + path + "'");
             return fail(RuntimeIssue::missing_model_bundle, had_loaded_model);
+        }
+        if (!model_supported_for_realtime_host(path)) {
+            magenta_v2_debug_log("load rejected before MLX: model unsupported on this Mac for '" +
+                                 path + "'");
+            return fail(RuntimeIssue::unsupported_model, had_loaded_model);
         }
 
         bool loaded = false;
@@ -552,14 +703,23 @@ private:
             return fail(RuntimeIssue::model_load_failed, false);
         }
 
+        st->generated_frames.store(0, std::memory_order_relaxed);
+        st->underrun_blocks.store(0, std::memory_order_relaxed);
+
         std::string prompt;
         { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
         apply_prompt_to_engine(st->engine, prompt);
         st->applied_prompt_revision.store(st->prompt_revision.load(std::memory_order_acquire),
                                           std::memory_order_release);
+        const auto encoder_start = std::chrono::steady_clock::now();
         while (st->running.load() &&
-               (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
+               (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1)) {
+            if (std::chrono::steady_clock::now() - encoder_start > 30s) {
+                magenta_v2_debug_log("encoder startup timed out for '" + path + "'");
+                return fail(RuntimeIssue::encoder_failed, false);
+            }
             std::this_thread::sleep_for(10ms);
+        }
         if (st->engine.get_text_encoder_status() == 3 || st->engine.get_quantizer_status() == 3) {
             magenta_v2_debug_log("encoder failed after model load for '" + path + "'");
             return fail(RuntimeIssue::encoder_failed, false);
