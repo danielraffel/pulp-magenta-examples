@@ -29,6 +29,8 @@
 #include <magentart/ring_buffer.h>
 #include <magentart/detail/autorelease_pool.h>
 
+#include <mlx/mlx.h>
+
 #include "magenta_models.hpp"     // kMagentaSubsystem — shared model store lookup
 #include "magenta_resources.hpp"  // shared_resources_dir/_complete — resources resolution
 
@@ -44,6 +46,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -66,12 +69,10 @@ inline std::string default_resources() {
     return (std::filesystem::path(env_or("HOME", "")) /
             "Documents/Magenta/magenta-rt-v2/resources").string();
 }
-// Resolve the model file. Explicit MRT2_MODEL wins; otherwise PREFER the large
-// model (mrt2_base, 2.4B — better quality, needs a Pro/Max Mac) when it's been
-// downloaded, and fall back to mrt2_small (230M, any M-series). Weights are NOT
-// bundled in the plugin (GB-scale, CC-BY-4.0 Google DeepMind) — the user installs
-// them once to this shared path via scripts/install-weights.sh, and every Pulp
-// Magenta plugin/app finds them here.
+// Resolve the model file. Explicit MRT2_MODEL wins; otherwise prefer the active
+// model selected in Pulp's shared model store. For the legacy ~/Documents/Magenta
+// path, prefer mrt2_small for broad Apple Silicon compatibility; users can still
+// opt into mrt2_base explicitly from the Models tab.
 inline std::string default_model() {
     if (const char* e = std::getenv("MRT2_MODEL"); e && *e) return e;
 
@@ -93,14 +94,15 @@ inline std::string default_model() {
         }
     }
 
-    // Legacy install path (scripts/install-weights.sh). Prefer the large model when present.
+    // Legacy install path (scripts/install-weights.sh). Prefer the small model so a copied
+    // app defaults to the most compatible complete checkpoint on M1-class machines.
     const auto root = std::filesystem::path(env_or("HOME", "")) /
                       "Documents/Magenta/magenta-rt-v2/models";
-    const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";   // large, preferred
-    const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";  // fallback
+    const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";
+    const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";
     std::error_code ec;
-    if (std::filesystem::exists(base, ec)) return base.string();
-    return small.string();
+    if (std::filesystem::exists(small, ec)) return small.string();
+    return base.string();
 }
 
 // Heap engine state shared between the Processor and its worker thread, so the
@@ -112,7 +114,10 @@ inline std::string default_model() {
 struct EngineState {
     magentart::core::MLXEngine engine;
     magentart::core::RingBuffer ring_l, ring_r;
-    std::atomic<bool> running{true}, loaded{false}, load_failed{false};
+    std::atomic<bool> running{true}, loaded{false}, loading{false};
+    std::atomic<bool> load_failed{false}, generation_failed{false};
+    std::atomic<std::uint64_t> generated_frames{0}, underrun_blocks{0};
+    std::atomic<float> last_frame_ms{0.0f};
 
     // Live model hot-reload. MLX makes streams/encoders thread_local, so the
     // model swap MUST run on the worker thread, not in the UI callback that asks
@@ -214,8 +219,19 @@ public:
         // Drain generated 48 kHz stereo from the ring (RT-safe; zero-padded on underrun).
         auto L = out.channel(0);
         auto R = out.channel(nch > 1 ? 1 : 0);
-        if (!st_->ring_l.read(L.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) L[i] = 0.0f; }
-        if (!st_->ring_r.read(R.data(), ns)) { for (std::size_t i = 0; i < ns; ++i) R[i] = 0.0f; }
+        const bool model_loaded = st_->loaded.load(std::memory_order_acquire);
+        bool underrun = false;
+        if (model_loaded) {
+            const bool ok_l = st_->ring_l.read(L.data(), ns);
+            const bool ok_r = st_->ring_r.read(R.data(), ns);
+            underrun = !ok_l || !ok_r;
+            if (underrun) st_->underrun_blocks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            for (std::size_t i = 0; i < ns; ++i) {
+                L[i] = 0.0f;
+                R[i] = 0.0f;
+            }
+        }
 
         FreezeLoopSamplerControls sampler_controls;
         sampler_controls.freeze = state().get_value(kFreeze) >= 0.5f;
@@ -256,6 +272,7 @@ public:
             },
             [this](const std::string& p) { if (st_) st_->set_prompt(p); },
             [] { std::error_code ec; return std::filesystem::exists(default_model(), ec); },  // model_ready
+            [this] { return runtime_status_text(); },
             // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
             // the newly-activated model from the shared store — it swaps live, no restart. We
             // must NOT rebuild the editor here (that would destroy the ModelSection mid-callback);
@@ -270,6 +287,30 @@ public:
 
     FreezeLoopSamplerStatus freeze_sampler_status() const noexcept {
         return freeze_sampler_.status();
+    }
+
+    std::string runtime_status_text() const {
+        const auto st = st_;
+        if (!st) return {};
+
+        if (st->loading.load(std::memory_order_acquire))
+            return "Loading Magenta model...";
+        if (st->generation_failed.load(std::memory_order_acquire))
+            return "Model generation stopped. Open Settings > Models and try redownloading Small.";
+        if (st->load_failed.load(std::memory_order_acquire))
+            return "Model failed to start. Open Settings > Models and try redownloading Small.";
+        if (!st->loaded.load(std::memory_order_acquire))
+            return {};
+
+        const auto generated = st->generated_frames.load(std::memory_order_relaxed);
+        if (generated < 3)
+            return "Model loaded; warming up generated audio...";
+
+        const auto underruns = st->underrun_blocks.load(std::memory_order_relaxed);
+        if (underruns > 200 && st->ring_l.available() == 0)
+            return "Generated audio is underrunning. Try Small, 48 kHz, and close other GPU-heavy apps.";
+
+        return {};
     }
 
     // V2 contributes a "Models" tab to the host's unified Settings panel; the host composes
@@ -293,16 +334,75 @@ private:
                             bool assets_ok) {
         using namespace std::chrono_literals;
         magentart::detail::AutoreleasePool pool;
+        st->loading.store(true, std::memory_order_release);
+        st->loaded.store(false, std::memory_order_release);
+        st->load_failed.store(false, std::memory_order_release);
+        st->generation_failed.store(false, std::memory_order_release);
+        st->generated_frames.store(0, std::memory_order_relaxed);
+        st->underrun_blocks.store(0, std::memory_order_relaxed);
         std::error_code ec;
-        if (!assets_ok || path.empty() || !std::filesystem::exists(path, ec)) return false;
+        if (!assets_ok || path.empty() || !std::filesystem::exists(path, ec)) {
+            st->loading.store(false, std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
+            return false;
+        }
         if (st->engine.is_loaded()) st->engine.unload();   // swap: drop the old model first
-        if (!st->engine.load_model(path.c_str())) return false;
+        if (!st->engine.load_model(path.c_str())) {
+            st->loading.store(false, std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
+            return false;
+        }
         std::string prompt;
         { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
         st->engine.set_text_prompt(prompt);
         while (st->running.load() &&
                (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1))
             std::this_thread::sleep_for(10ms);
+        st->loading.store(false, std::memory_order_release);
+        return true;
+    }
+
+    static bool generate_and_write_frame(const std::shared_ptr<EngineState>& st,
+                                         float* L, float* R) {
+        using namespace std::chrono_literals;
+        namespace mc = magentart::core;
+        {
+            magentart::detail::AutoreleasePool pool;
+            const auto start = std::chrono::steady_clock::now();
+            if (!st->engine.generate_frame(L, R)) {
+                st->generation_failed.store(true, std::memory_order_release);
+                st->load_failed.store(true, std::memory_order_release);
+                return false;
+            }
+            const auto end = std::chrono::steady_clock::now();
+            st->last_frame_ms.store(
+                std::chrono::duration<float, std::milli>(end - start).count(),
+                std::memory_order_relaxed);
+        }
+
+        while (st->running.load(std::memory_order_relaxed) &&
+               (st->ring_l.free_space() < mc::kFrameSamples ||
+                st->ring_r.free_space() < mc::kFrameSamples)) {
+            auto dummy = mlx::core::array({0.0f}) + mlx::core::array({0.0f});
+            mlx::core::eval(dummy);
+            std::this_thread::sleep_for(200us);
+        }
+        if (!st->running.load(std::memory_order_relaxed)) return false;
+        if (!st->ring_l.write(L, mc::kFrameSamples) ||
+            !st->ring_r.write(R, mc::kFrameSamples)) {
+            st->generation_failed.store(true, std::memory_order_release);
+            st->load_failed.store(true, std::memory_order_release);
+            return false;
+        }
+        st->generated_frames.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    static bool prime_output_ring(const std::shared_ptr<EngineState>& st,
+                                  float* L, float* R) {
+        for (int i = 0; i < 3; ++i) {
+            if (!generate_and_write_frame(st, L, R)) return false;
+        }
         return true;
     }
 
@@ -329,34 +429,33 @@ private:
             std::fprintf(stderr,
                 "[PromptableAccompanistV2] No MRT2 model installed yet. Open Settings -> Models to\n"
                 "  download one (mrt2_small or mrt2_base) — it will start playing without a restart.\n");
-        bool ok = worker_load(st, initial, assets_ok);
-        st->loaded.store(ok);
-        st->load_failed.store(!ok);
-
         float L[mc::kFrameSamples], R[mc::kFrameSamples];
-        const std::size_t headroom = mc::RingBuffer::kCapacity - 2 * mc::kFrameSamples;
+        bool ok = worker_load(st, initial, assets_ok);
+        if (ok) ok = prime_output_ring(st, L, R);
+        st->loaded.store(ok, std::memory_order_release);
+        st->load_failed.store(!ok, std::memory_order_release);
+
         while (st->running.load()) {
             // Service a hot-reload at a frame boundary (on this MLX-owning thread).
             if (st->reload_requested.exchange(false, std::memory_order_acquire)) {
                 std::string path;
                 { std::lock_guard<std::mutex> lk(st->mutex_); path = st->pending_model_path; }
-                st->loaded.store(false);
-                const bool rok = worker_load(st, path, assets_ok);
-                st->loaded.store(rok);
-                st->load_failed.store(!rok);
+                const bool rok_load = worker_load(st, path, assets_ok);
+                bool rok = rok_load;
+                if (rok) rok = prime_output_ring(st, L, R);
+                st->loaded.store(rok, std::memory_order_release);
+                st->load_failed.store(!rok, std::memory_order_release);
             }
             if (!st->loaded.load()) {               // no model yet → idle, stay responsive
                 std::this_thread::sleep_for(20ms);
                 continue;
             }
-            if (st->ring_l.available() > headroom) {  // ring nearly full → wait
-                std::this_thread::sleep_for(2ms);
-                continue;
+            if (!generate_and_write_frame(st, L, R)) {
+                st->loaded.store(false, std::memory_order_release);
+                std::fprintf(stderr,
+                             "[PromptableAccompanistV2] MRT2 generation stopped; "
+                             "the instrument will stay silent until the model is reloaded.\n");
             }
-            magentart::detail::AutoreleasePool pool;
-            if (!st->engine.generate_frame(L, R)) break;
-            st->ring_l.write(L, mc::kFrameSamples);
-            st->ring_r.write(R, mc::kFrameSamples);
         }
     }
 

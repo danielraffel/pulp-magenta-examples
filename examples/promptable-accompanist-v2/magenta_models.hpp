@@ -28,7 +28,7 @@ inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
         ModelEntry{
             .model_id = "mrt2_small",
             .display_name = "Magenta RealTime 2 — Small",
-            .description = "230M parameters. Runs on any Apple-silicon Mac.",
+            .description = "230M parameters. Recommended for first run and Apple Silicon Macs.",
             .backend = "mlx",
             .checkpoint_ref = "hf://google/magenta-realtime-2/models/mrt2_small/mrt2_small.mlxfn",
             .size_bytes = 443ULL * 1024 * 1024,
@@ -42,7 +42,7 @@ inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
                                .checkpoint_ref = "hf://google/magenta-realtime-2/models/mrt2_small/"
                                                  "mrt2_small_state.safetensors"},
                 },
-            .is_recommended = false,
+            .is_recommended = true,
             .license = "CC-BY-4.0",
             .attribution = "Google DeepMind",
             .min_device = "Apple silicon",
@@ -50,7 +50,7 @@ inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
         ModelEntry{
             .model_id = "mrt2_base",
             .display_name = "Magenta RealTime 2 — Large",
-            .description = "2.4B parameters. Best quality; needs a Pro/Max Mac.",
+            .description = "2.4B parameters. Best quality; needs a high-end Pro/Max Mac.",
             .backend = "mlx",
             .checkpoint_ref = "hf://google/magenta-realtime-2/models/mrt2_base/mrt2_base.mlxfn",
             .size_bytes = 2600ULL * 1024 * 1024,
@@ -64,10 +64,10 @@ inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
                                .checkpoint_ref = "hf://google/magenta-realtime-2/models/mrt2_base/"
                                                  "mrt2_base_state.safetensors"},
                 },
-            .is_recommended = true,
+            .is_recommended = false,
             .license = "CC-BY-4.0",
             .attribution = "Google DeepMind",
-            .min_device = "Pro/Max",
+            .min_device = "High-end Pro/Max",
         },
     };
     return models;

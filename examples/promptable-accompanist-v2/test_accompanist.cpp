@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -21,6 +22,42 @@ using namespace pulp::examples::accompanist_v2;
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("FAIL: %s\n", msg); return 1; } } while (0)
 
 namespace {
+
+class EnvGuard {
+public:
+    EnvGuard(const char* key, const char* value) : key_(key) {
+        if (const char* old = std::getenv(key_)) {
+            had_old_ = true;
+            old_ = old;
+        }
+        if (value) setenv(key_, value, 1);
+        else unsetenv(key_);
+    }
+
+    ~EnvGuard() {
+        if (had_old_) setenv(key_, old_.c_str(), 1);
+        else unsetenv(key_);
+    }
+
+private:
+    const char* key_;
+    bool had_old_ = false;
+    std::string old_;
+};
+
+std::filesystem::path unique_temp_dir(const char* name) {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto path = std::filesystem::temp_directory_path() /
+                (std::string(name) + "-" + std::to_string(stamp));
+    std::filesystem::create_directories(path);
+    return path;
+}
+
+void touch_file(const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path);
+    file << "x";
+}
 
 void fill_test_audio(pulp::audio::Buffer<float>& block, int block_index) {
     constexpr double kTwoPi = 6.28318530717958647692;
@@ -181,6 +218,32 @@ bool wait_for_released_runtime_sample(Processor& processor,
     return false;
 }
 
+int check_model_registry_defaults() {
+    const auto& models = magenta_demo::magenta_models();
+    CHECK(models.size() == 2, "two MRT2 model choices are registered");
+    CHECK(models[0].model_id == "mrt2_small", "small model is listed first");
+    CHECK(models[0].is_recommended, "small model is recommended");
+    CHECK(models[1].model_id == "mrt2_base", "large model is listed second");
+    CHECK(!models[1].is_recommended, "large model is not the default recommendation");
+
+    const auto home = unique_temp_dir("pulp-magenta-v2-model-default");
+    EnvGuard home_guard("HOME", home.c_str());
+    EnvGuard pulp_home_guard("PULP_HOME", nullptr);
+    EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+
+    const auto root = home / "Documents/Magenta/magenta-rt-v2/models";
+    const auto small = root / "mrt2_small/mrt2_small.mlxfn";
+    const auto base = root / "mrt2_base/mrt2_base.mlxfn";
+    touch_file(base);
+    touch_file(small);
+    CHECK(default_model() == small.string(), "legacy resolver prefers small when both models exist");
+
+    std::filesystem::remove(small);
+    CHECK(default_model() == base.string(), "legacy resolver falls back to base when small is absent");
+    std::filesystem::remove_all(home);
+    return 0;
+}
+
 int run_generated_runtime_smoke_if_requested() {
     const char* enabled = std::getenv("PULP_MAGENTA_V2_RUN_MODEL_SMOKE");
     if (enabled == nullptr || std::string(enabled) != "1") return 0;
@@ -268,6 +331,9 @@ int run_generated_runtime_smoke_if_requested() {
 }  // namespace
 
 int main() {
+    const int registry_result = check_model_registry_defaults();
+    if (registry_result != 0) return registry_result;
+
     Processor p;
     auto d = p.descriptor();
     CHECK(d.name == "PromptableAccompanistV2", "descriptor name is v2");
