@@ -387,6 +387,8 @@ int check_runtime_status_priority() {
                                            0);
     CHECK(processor.runtime_status_text().find("Download a model") != std::string::npos,
           "candidate-less loading state tells the user to download a model");
+    CHECK(!processor.model_ready_for_editor_for_test(),
+          "candidate-less loading state stays on the download-model gate");
 
     processor.force_runtime_flags_for_test(false,
                                            true,
@@ -396,6 +398,8 @@ int check_runtime_status_priority() {
                                            true);
     CHECK(processor.runtime_status_text().find("Loading Magenta model") != std::string::npos,
           "valid candidate loading state still reports model loading");
+    CHECK(processor.model_ready_for_editor_for_test(),
+          "valid candidate loading state can show the instrument editor");
 
     processor.force_runtime_flags_for_test(false,
                                            true,
@@ -544,7 +548,7 @@ std::string alternate_model_path_for_runtime_smoke(const std::string& current) {
         legacy / "mrt2_small/mrt2_small.mlxfn",
     };
     for (const auto& candidate : candidates)
-        if (candidate.string() != current && model_bundle_complete(candidate))
+        if (candidate.string() != current && model_bundle_usable(candidate))
             return candidate.string();
     return {};
 }
@@ -668,17 +672,7 @@ int run_generated_runtime_smoke_if_requested() {
     CHECK(processor.runtime_status_text().find("failed") == std::string::npos,
           "runtime smoke clear prompt does not fail model encoders");
 
-    const std::string hot_switch_model = alternate_model_path_for_runtime_smoke(default_model());
-    if (!hot_switch_model.empty()) {
-        processor.request_model_reload_for_test(hot_switch_model);
-        CHECK(wait_for_loaded_model_path(processor, output, block_index, hot_switch_model, 2400),
-              "runtime smoke hot-switches to another installed model");
-        const auto status = processor.runtime_status_text();
-        CHECK(status.find("encoders failed") == std::string::npos,
-              "runtime smoke hot model switch keeps MusicCoCa encoders available");
-        CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 2400),
-              "runtime smoke generated audio after hot model switch");
-
+    auto check_bad_reload_preserves_current = [&]() -> int {
         const auto loaded_before_bad_reload = processor.loaded_model_path_for_test();
         const auto bad_reload = unique_temp_dir("pulp-magenta-v2-bad-reload") /
                                 "mrt2_small/mrt2_small.mlxfn";
@@ -693,7 +687,22 @@ int run_generated_runtime_smoke_if_requested() {
               "runtime smoke keeps the previous model selected after rejected reload");
         CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 240),
               "runtime smoke keeps generated audio alive after rejected reload");
+        return 0;
+    };
+
+    const std::string hot_switch_model = alternate_model_path_for_runtime_smoke(default_model());
+    if (!hot_switch_model.empty()) {
+        processor.request_model_reload_for_test(hot_switch_model);
+        CHECK(wait_for_loaded_model_path(processor, output, block_index, hot_switch_model, 2400),
+              "runtime smoke hot-switches to another installed model");
+        const auto status = processor.runtime_status_text();
+        CHECK(status.find("encoders failed") == std::string::npos,
+              "runtime smoke hot model switch keeps MusicCoCa encoders available");
+        CHECK(wait_for_generated_audio(processor, output, block_index, kAudibleRms, 2400),
+              "runtime smoke generated audio after hot model switch");
     }
+    if (const int bad_reload_result = check_bad_reload_preserves_current(); bad_reload_result != 0)
+        return bad_reload_result;
 
     for (int i = 0; i < 32; ++i) {
         process_runtime_block(processor, output, block_index++);

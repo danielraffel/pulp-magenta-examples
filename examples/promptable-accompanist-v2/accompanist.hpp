@@ -470,18 +470,7 @@ public:
                 return buf;
             },
             [this](const std::string& p) { if (st_) st_->set_prompt(p); },
-            [this] {
-                const auto st = st_;
-                if (st && st->loading.load(std::memory_order_acquire))
-                    return true;
-                if (st && st->loaded.load(std::memory_order_acquire)) {
-                    std::string loaded_path;
-                    { std::lock_guard<std::mutex> lk(st->mutex_); loaded_path = st->loaded_model_path; }
-                    if (!loaded_path.empty() && model_bundle_usable(loaded_path))
-                        return true;
-                }
-                return !default_model().empty();
-            },  // model_ready
+            [this] { return model_ready_for_editor(); },  // model_ready
             [this] { return runtime_status_text(); },
             // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
             // the newly-activated model from the shared store — it swaps live, no restart. We
@@ -509,6 +498,10 @@ public:
         if (!st) return {};
         std::lock_guard<std::mutex> lk(st->mutex_);
         return st->loaded_model_path;
+    }
+
+    bool model_ready_for_editor_for_test() const {
+        return model_ready_for_editor();
     }
 
     void set_prompt_for_test(const std::string& prompt) {
@@ -609,6 +602,19 @@ public:
         return sections;
     }
 private:
+    bool model_ready_for_editor() const {
+        const auto st = st_;
+        if (st && st->loading.load(std::memory_order_acquire))
+            return st->loading_model_candidate_valid.load(std::memory_order_acquire);
+        if (st && st->loaded.load(std::memory_order_acquire)) {
+            std::string loaded_path;
+            { std::lock_guard<std::mutex> lk(st->mutex_); loaded_path = st->loaded_model_path; }
+            if (!loaded_path.empty() && model_bundle_usable(loaded_path))
+                return true;
+        }
+        return !default_model().empty();
+    }
+
     void request_reload_to_default_model() {
         if (!st_) return;
         const auto path = default_model();
