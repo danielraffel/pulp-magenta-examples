@@ -244,6 +244,45 @@ int check_model_registry_defaults() {
     return 0;
 }
 
+int check_status_banner_refreshes_after_late_frame_clock() {
+    bool model_ready = true;
+    std::string runtime_status = "Loading Magenta model...";
+
+    auto root = std::make_unique<magenta_demo::AccompanistRoot>(
+        [](std::uint32_t, float) {},
+        [](std::uint32_t) { return 0.5f; },
+        [](std::uint32_t) { return std::string("0"); },
+        [](const std::string&) {},
+        [&model_ready] { return model_ready; },
+        [&runtime_status] { return runtime_status; },
+        [] {},
+        "warm analog pads");
+    auto* root_ptr = root.get();
+    CHECK(root_ptr->child_count() == 3,
+          "runtime status banner is rendered while the model is loading");
+
+    pulp::view::View parent;
+    parent.add_child(std::move(root));
+
+    runtime_status.clear();
+    pulp::view::FrameClock clock;
+    parent.set_frame_clock(&clock);
+    root_ptr->layout_children();
+    CHECK(root_ptr->child_count() == 2,
+          "late frame-clock attachment clears a stale loading banner");
+
+    runtime_status = "Generated audio is underrunning. Try Small, 48 kHz, and close other GPU-heavy apps.";
+    clock.tick(1.0f / 60.0f);
+    CHECK(root_ptr->child_count() == 3,
+          "runtime status banner appears when a later warning is published");
+
+    runtime_status.clear();
+    clock.tick(1.0f / 60.0f);
+    CHECK(root_ptr->child_count() == 2,
+          "runtime status banner clears when the later warning resolves");
+    return 0;
+}
+
 int run_generated_runtime_smoke_if_requested() {
     const char* enabled = std::getenv("PULP_MAGENTA_V2_RUN_MODEL_SMOKE");
     if (enabled == nullptr || std::string(enabled) != "1") return 0;
@@ -333,6 +372,8 @@ int run_generated_runtime_smoke_if_requested() {
 int main() {
     const int registry_result = check_model_registry_defaults();
     if (registry_result != 0) return registry_result;
+    const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
+    if (status_banner_result != 0) return status_banner_result;
 
     Processor p;
     auto d = p.descriptor();

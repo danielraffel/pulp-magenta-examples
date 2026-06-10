@@ -54,8 +54,12 @@ public:
     /// gate and the instrument.
     void refresh() { rebuild(); }
 
-    void on_attached() override { start_status_poll(); }
+    void on_attached() override { ensure_status_poll_started(); }
     void on_detached() override { stop_status_poll(); }
+    void layout_children() override {
+        ensure_status_poll_started();
+        pulp::view::View::layout_children();
+    }
 
 private:
     bool model_ready_now() const {
@@ -66,22 +70,27 @@ private:
         return runtime_status_ ? runtime_status_() : std::string();
     }
 
-    void start_status_poll() {
+    bool poll_status_once() {
+        const bool ready = model_ready_now();
+        const std::string status = runtime_status_now();
+        if (ready == last_model_ready_ && status == last_runtime_status_) return false;
+        last_model_ready_ = ready;
+        last_runtime_status_ = status;
+        rebuild();
+        request_repaint();
+        return true;
+    }
+
+    void ensure_status_poll_started() {
         if (frame_sub_ >= 0) return;
-        last_model_ready_ = model_ready_now();
-        last_runtime_status_ = runtime_status_now();
         if (auto* fc = frame_clock()) {
             status_clock_ = fc;
             frame_sub_ = status_clock_->subscribe([this](float) {
-                const bool ready = model_ready_now();
-                const std::string status = runtime_status_now();
-                if (ready != last_model_ready_ || status != last_runtime_status_) {
-                    last_model_ready_ = ready;
-                    last_runtime_status_ = status;
-                    rebuild();
-                }
+                poll_status_once();
                 return true;
             });
+            poll_status_once();
+            request_repaint();
         }
     }
 
@@ -214,17 +223,23 @@ private:
         }
         while (child_count() > 0) remove_child(child_at(0));
 
+        const bool ready = model_ready_now();
+        last_model_ready_ = ready;
+
         if (show_models_)
             show_models_overlay();
-        else if (model_ready_now())
+        else if (ready)
             show_editor();
-        else
+        else {
+            last_runtime_status_.clear();
             show_need_model();
+        }
     }
 
     void show_editor() {
         add_child(make_top_bar(make_text_button("\xE2\x9A\x99 Settings", [this] { open_settings(); })));
         const std::string status = runtime_status_now();
+        last_runtime_status_ = status;
         if (!status.empty()) add_child(make_status_banner(status));
 
         if (!native_ui_held_) {
