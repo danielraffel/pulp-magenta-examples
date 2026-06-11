@@ -86,6 +86,21 @@ inline bool resources_complete_at(const std::filesystem::path& dir) {
     return true;
 }
 
+// Runtime availability is intentionally looser than download completeness.
+// The size manifest is only a repair/download hint; if all resource files are
+// present, let MLX/MusicCoCa init_assets() decide whether they are usable.
+inline bool resources_available_at(const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& f : magenta_resource_files()) {
+        const auto path = dir / f.rel_path;
+        if (!std::filesystem::exists(path, ec)) return false;
+        ec.clear();
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size == 0) return false;
+    }
+    return true;
+}
+
 // All required resource files present on disk in the shared store?
 inline bool shared_resources_complete() {
     return resources_complete_at(shared_resources_dir());
@@ -97,6 +112,18 @@ inline bool legacy_resources_complete() {
 
 inline bool runtime_resources_complete() {
     return shared_resources_complete() || legacy_resources_complete();
+}
+
+inline bool shared_resources_available() {
+    return resources_available_at(shared_resources_dir());
+}
+
+inline bool legacy_resources_available() {
+    return resources_available_at(legacy_resources_dir());
+}
+
+inline bool runtime_resources_available() {
+    return shared_resources_available() || legacy_resources_available();
 }
 
 inline std::uint64_t magenta_resources_total_bytes() {

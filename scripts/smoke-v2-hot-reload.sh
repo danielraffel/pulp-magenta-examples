@@ -18,6 +18,16 @@ cmake --build "$build_dir" \
   --target promptable-accompanist-v2-test PromptableAccompanistV2_Standalone \
   -j"$jobs"
 
+standalone_app="$build_dir/examples/promptable-accompanist-v2/PromptableAccompanistV2.app"
+standalone_metallib="$standalone_app/Contents/MacOS/mlx.metallib"
+build_metallib="$build_dir/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib"
+test -s "$build_metallib"
+test -s "$standalone_metallib"
+cmp -s "$build_metallib" "$standalone_metallib"
+if command -v codesign >/dev/null 2>&1; then
+  codesign --verify --deep --strict "$standalone_app"
+fi
+
 test_flags="$(find "$build_dir/examples/promptable-accompanist-v2" \
   -path '*/CMakeFiles/promptable-accompanist-v2-test.dir/flags.make' \
   -print -quit)"

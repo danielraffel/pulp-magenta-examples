@@ -6,7 +6,9 @@
 
 #include <pulp/runtime/scoped_no_alloc.hpp>
 #include <pulp/view/text_editor.hpp>
+#include <pulp/view/widgets.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -19,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace pulp::examples::accompanist_v2;
 
@@ -117,6 +120,19 @@ void fill_constant_audio(pulp::audio::Buffer<float>& block, float value) {
     }
 }
 
+void fill_keyed_sampler_test_audio(pulp::audio::Buffer<float>& block, int block_index) {
+    constexpr double kTwoPi = 6.28318530717958647692;
+    for (std::size_t ch = 0; ch < block.num_channels(); ++ch) {
+        auto samples = block.channel(ch);
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const auto n = static_cast<double>(block_index * samples.size() + i) +
+                           static_cast<double>(ch) * 23.0;
+            const auto phase = 0.0065 * n + 0.0000017 * n * n;
+            samples[i] = static_cast<float>(0.22 * std::sin(kTwoPi * phase));
+        }
+    }
+}
+
 double max_abs_error_from(const pulp::audio::Buffer<float>& block, double expected) {
     double max_error = 0.0;
     for (std::size_t ch = 0; ch < block.num_channels(); ++ch) {
@@ -139,6 +155,17 @@ double rms_audio(const pulp::audio::Buffer<float>& block) {
         }
     }
     return count > 0 ? std::sqrt(sum_squares / static_cast<double>(count)) : 0.0;
+}
+
+bool tree_contains_label_text(const pulp::view::View& view, const std::string& needle) {
+    if (const auto* label = dynamic_cast<const pulp::view::Label*>(&view);
+        label && label->text().find(needle) != std::string::npos)
+        return true;
+    for (std::size_t i = 0; i < view.child_count(); ++i) {
+        if (const auto* child = view.child_at(i))
+            if (tree_contains_label_text(*child, needle)) return true;
+    }
+    return false;
 }
 
 double process_constant_blocks_and_measure_error(FreezeLoopSampler& sampler,
@@ -179,6 +206,70 @@ bool wait_for_frozen_sample(FreezeLoopSampler& sampler,
         std::this_thread::sleep_for(2ms);
     }
     return false;
+}
+
+bool render_keyed_frozen_note(int note, std::vector<float>& result) {
+    FreezeLoopSampler sampler;
+    FreezeLoopSamplerConfig config;
+    config.num_channels = 2;
+    config.sample_rate = 48000.0;
+    config.max_block_frames = 64;
+    config.max_capture_seconds = 0.25;
+    config.sample_slots = 2;
+    if (!sampler.prepare(config)) return false;
+
+    pulp::audio::Buffer<float> block(2, 64);
+    FreezeLoopSamplerControls live_controls;
+    live_controls.freeze = false;
+    live_controls.capture_seconds = 0.05;
+    live_controls.loop_crossfade_ms = 5.0;
+
+    for (int i = 0; i < 32; ++i) {
+        fill_keyed_sampler_test_audio(block, i);
+        auto view = block.view();
+        sampler.process(view, live_controls);
+    }
+
+    FreezeLoopSamplerControls freeze_controls = live_controls;
+    freeze_controls.freeze = true;
+    fill_keyed_sampler_test_audio(block, 32);
+    auto freeze_view = block.view();
+    sampler.process(freeze_view, freeze_controls);
+    if (!wait_for_frozen_sample(sampler, block, freeze_controls)) {
+        sampler.shutdown();
+        return false;
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        fill_constant_audio(block, 0.0f);
+        auto view = block.view();
+        sampler.process(view, freeze_controls);
+    }
+
+    pulp::midi::MidiBuffer note_on;
+    note_on.add(pulp::midi::MidiEvent::note_on(0, static_cast<std::uint8_t>(note), 110));
+    FreezeLoopSamplerControls keyed_controls = freeze_controls;
+    keyed_controls.midi = &note_on;
+    keyed_controls.root_note = 60;
+    fill_constant_audio(block, 0.0f);
+    auto note_on_view = block.view();
+    sampler.process(note_on_view, keyed_controls);
+
+    pulp::midi::MidiBuffer no_midi;
+    keyed_controls.midi = &no_midi;
+    result.clear();
+    for (int i = 0; i < 12; ++i) {
+        fill_constant_audio(block, 0.0f);
+        auto view = block.view();
+        sampler.process(view, keyed_controls);
+        if (i >= 4) {
+            const auto channel = block.channel(0);
+            result.insert(result.end(), channel.begin(), channel.end());
+        }
+    }
+
+    sampler.shutdown();
+    return !result.empty();
 }
 
 void process_runtime_block(Processor& processor,
@@ -388,6 +479,14 @@ int check_runtime_status_priority() {
     CHECK(processor.runtime_status_text().find("download or repair a model") != std::string::npos,
           "deleted loaded model status tells the user to download or repair a model");
 
+    processor.force_runtime_flags_for_test(true,
+                                           false,
+                                           true,
+                                           RuntimeIssue::missing_resources,
+                                           4);
+    CHECK(processor.runtime_status_text().empty(),
+          "loaded model suppresses stale resource repair warnings");
+
     processor.force_runtime_flags_for_test(false,
                                            true,
                                            false,
@@ -490,18 +589,17 @@ int check_status_banner_refreshes_after_late_frame_clock() {
         [] {},
         "warm analog pads");
     auto* root_ptr = root.get();
-    CHECK(root_ptr->child_count() == 3,
-          "runtime status banner is rendered while the model is loading");
+    CHECK(root_ptr->child_count() == 2,
+          "transient loading status is not rendered once the editor is usable");
 
     pulp::view::View parent;
     parent.add_child(std::move(root));
 
-    runtime_status.clear();
     pulp::view::FrameClock clock;
     parent.set_frame_clock(&clock);
     root_ptr->layout_children();
     CHECK(root_ptr->child_count() == 2,
-          "late frame-clock attachment clears a stale loading banner");
+          "late frame-clock attachment does not need to clear transient loading UI");
 
     runtime_status = "Generated audio is underrunning. Try Small, 48 kHz, and close other GPU-heavy apps.";
     clock.tick(1.0f / 60.0f);
@@ -512,6 +610,28 @@ int check_status_banner_refreshes_after_late_frame_clock() {
     clock.tick(1.0f / 60.0f);
     CHECK(root_ptr->child_count() == 2,
           "runtime status banner clears when the later warning resolves");
+    return 0;
+}
+
+int check_model_section_surfaces_storage_locations() {
+    const auto home = unique_temp_dir("pulp-magenta-v2-model-section");
+    const auto pulp_home = home / ".pulp";
+    const auto home_string = home.string();
+    const auto pulp_home_string = pulp_home.string();
+    EnvGuard home_guard("HOME", home_string.c_str());
+    EnvGuard pulp_home_guard("PULP_HOME", pulp_home_string.c_str());
+
+    const auto shared_root = pulp_home / "magenta/models";
+    touch_model_file(shared_root / "mrt2_small/mrt2_small.mlxfn");
+    touch_model_file(shared_root / "mrt2_small/mrt2_small_state.safetensors");
+
+    magenta_demo::ModelSection section([] {});
+    CHECK(tree_contains_label_text(section, "Model folder"),
+          "model section shows the shared model folder");
+    CHECK(tree_contains_label_text(section, shared_root.string()),
+          "model section shows the resolved shared Pulp model path");
+    CHECK(tree_contains_label_text(section, "Small detected"),
+          "model section reports a complete shared Small bundle");
     return 0;
 }
 
@@ -545,10 +665,71 @@ int check_prompt_clear_contract() {
     return 0;
 }
 
+int check_generation_watchdog_detects_stagnant_frames() {
+    EngineState st;
+    std::array<float, 256> left{};
+    std::array<float, 256> right{};
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        left[i] = 0.08f + static_cast<float>(i % 11) * 0.001f;
+        right[i] = -0.04f + static_cast<float>(i % 7) * 0.001f;
+    }
+
+    CHECK(!update_generation_stagnation_watchdog(st, left.data(), right.data(), left.size()),
+          "generation watchdog accepts the first audible frame");
+    for (int i = 1; i < kGenerationStagnationFrameLimit; ++i) {
+        CHECK(!update_generation_stagnation_watchdog(st, left.data(), right.data(), left.size()),
+              "generation watchdog waits through tolerated repeated frames");
+    }
+    CHECK(update_generation_stagnation_watchdog(st, left.data(), right.data(), left.size()),
+          "generation watchdog detects repeated generated frames");
+    CHECK(st.previous_generation_signature == 0 && st.repeated_generation_frames == 0,
+          "generation watchdog resets after reporting stagnation");
+
+    left[0] += 0.25f;
+    CHECK(!update_generation_stagnation_watchdog(st, left.data(), right.data(), left.size()),
+          "generation watchdog resets on changed audio");
+    left.fill(0.0f);
+    right.fill(0.0f);
+    CHECK(!update_generation_stagnation_watchdog(st, left.data(), right.data(), left.size()),
+          "generation watchdog ignores silence");
+    return 0;
+}
+
+int check_package_audit_mutes_generated_audio_by_default() {
+    {
+        EnvGuard audit_guard("PULP_STANDALONE_PACKAGE_AUDIT", "1");
+        EnvGuard generic_audio_guard("PULP_STANDALONE_PACKAGE_AUDIT_AUDIO", nullptr);
+        EnvGuard app_audio_guard("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO", nullptr);
+        CHECK(package_audit_audio_muted(),
+              "package audit mutes generated audio by default");
+    }
+    {
+        EnvGuard audit_guard("PULP_STANDALONE_PACKAGE_AUDIT", "1");
+        EnvGuard generic_audio_guard("PULP_STANDALONE_PACKAGE_AUDIT_AUDIO", "1");
+        EnvGuard app_audio_guard("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO", nullptr);
+        CHECK(!package_audit_audio_muted(),
+              "generic opt-in allows audible package audit");
+    }
+    {
+        EnvGuard audit_guard("PULP_STANDALONE_PACKAGE_AUDIT", "1");
+        EnvGuard generic_audio_guard("PULP_STANDALONE_PACKAGE_AUDIT_AUDIO", nullptr);
+        EnvGuard app_audio_guard("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO", "1");
+        CHECK(!package_audit_audio_muted(),
+              "app opt-in allows audible package audit");
+    }
+    {
+        EnvGuard audit_guard("PULP_STANDALONE_PACKAGE_AUDIT", nullptr);
+        EnvGuard generic_audio_guard("PULP_STANDALONE_PACKAGE_AUDIT_AUDIO", nullptr);
+        EnvGuard app_audio_guard("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO", nullptr);
+        CHECK(!package_audit_audio_muted(),
+              "normal launches are not package-audit muted");
+    }
+    return 0;
+}
+
 std::string alternate_model_path_for_runtime_smoke(const std::string& current) {
     const auto shared = pulp::runtime::resolve_pulp_home() / "magenta/models";
-    const auto legacy = std::filesystem::path(env_or("HOME", "")) /
-                        "Documents/Magenta/magenta-rt-v2/models";
+    const auto legacy = magenta_demo::legacy_magenta_models_root();
     const std::array<std::filesystem::path, 4> candidates = {
         shared / "mrt2_base/mrt2_base.mlxfn",
         shared / "mrt2_small/mrt2_small.mlxfn",
@@ -688,7 +869,7 @@ int run_generated_runtime_smoke_if_requested() {
         CHECK(wait_for_runtime_status_containing(processor,
                                                  output,
                                                  block_index,
-                                                 "missing or incomplete",
+                                                 "download or repair a model",
                                                  240),
               "runtime smoke reports an incomplete requested model");
         CHECK(processor.loaded_model_path_for_test() == loaded_before_bad_reload,
@@ -746,8 +927,14 @@ int main() {
     if (worker_preflight_result != 0) return worker_preflight_result;
     const int status_banner_result = check_status_banner_refreshes_after_late_frame_clock();
     if (status_banner_result != 0) return status_banner_result;
+    const int model_section_result = check_model_section_surfaces_storage_locations();
+    if (model_section_result != 0) return model_section_result;
     const int prompt_clear_result = check_prompt_clear_contract();
     if (prompt_clear_result != 0) return prompt_clear_result;
+    const int generation_watchdog_result = check_generation_watchdog_detects_stagnant_frames();
+    if (generation_watchdog_result != 0) return generation_watchdog_result;
+    const int package_audit_audio_result = check_package_audit_mutes_generated_audio_by_default();
+    if (package_audit_audio_result != 0) return package_audit_audio_result;
 
     Processor p;
     auto d = p.descriptor();
@@ -879,6 +1066,30 @@ int main() {
     CHECK(contract_sampler.status().materialize_failures == 0,
           "audible contract path has no materialization failure");
     contract_sampler.shutdown();
+
+    std::vector<float> keyed_root;
+    std::vector<float> keyed_octave;
+    CHECK(render_keyed_frozen_note(60, keyed_root),
+          "keyed freeze sampler renders root note");
+    CHECK(render_keyed_frozen_note(72, keyed_octave),
+          "keyed freeze sampler renders octave note");
+    double keyed_root_energy = 0.0;
+    double keyed_octave_energy = 0.0;
+    double keyed_delta = 0.0;
+    const auto keyed_count = std::min(keyed_root.size(), keyed_octave.size());
+    for (std::size_t i = 0; i < keyed_count; ++i) {
+        keyed_root_energy += static_cast<double>(keyed_root[i]) * keyed_root[i];
+        keyed_octave_energy += static_cast<double>(keyed_octave[i]) * keyed_octave[i];
+        keyed_delta = std::max(keyed_delta,
+                               std::fabs(static_cast<double>(keyed_root[i] - keyed_octave[i])));
+    }
+    CHECK(keyed_count > 0, "keyed freeze sampler captures comparison output");
+    CHECK(std::sqrt(keyed_root_energy / static_cast<double>(keyed_count)) > 1.0e-4,
+          "keyed freeze sampler root note is audible");
+    CHECK(std::sqrt(keyed_octave_energy / static_cast<double>(keyed_count)) > 1.0e-4,
+          "keyed freeze sampler octave note is audible");
+    CHECK(keyed_delta > 1.0e-3,
+          "keyed freeze sampler changes playback rate by MIDI note");
 
     FreezeLoopSampler shape_sampler;
     CHECK(shape_sampler.prepare(config), "shape guard sampler prepares");

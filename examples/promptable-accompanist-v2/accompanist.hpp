@@ -106,11 +106,14 @@ inline void magenta_v2_debug_log(const std::string& message) {
 inline std::string default_resources() {
     if (const char* e = std::getenv("MRT2_RESOURCES"); e && *e) return e;
     // Prefer the shared store (~/.pulp/magenta/resources) when the in-plugin overlay
-    // has downloaded the full set — that's what a plugin-only install populates. Fall
-    // back to the legacy ~/Documents/Magenta layout otherwise.
-    if (magenta_demo::shared_resources_complete())
+    // has downloaded the required files — that's what a plugin-only install populates.
+    // Use exact-size completeness only for repairs/download progress; runtime should
+    // try a present resource set and let init_assets() be the final authority.
+    if (magenta_demo::shared_resources_available())
         return magenta_demo::shared_resources_dir().string();
-    return magenta_demo::legacy_resources_dir().string();
+    if (magenta_demo::legacy_resources_available())
+        return magenta_demo::legacy_resources_dir().string();
+    return magenta_demo::shared_resources_dir().string();
 }
 
 inline bool model_bundle_complete(const std::filesystem::path& checkpoint) {
@@ -120,6 +123,12 @@ inline bool model_bundle_complete(const std::filesystem::path& checkpoint) {
 inline bool env_truthy(const char* key) {
     const char* v = std::getenv(key);
     return v && *v && std::string(v) != "0";
+}
+
+inline bool package_audit_audio_muted() {
+    if (!env_truthy("PULP_STANDALONE_PACKAGE_AUDIT")) return false;
+    return !env_truthy("PULP_STANDALONE_PACKAGE_AUDIT_AUDIO") &&
+           !env_truthy("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO");
 }
 
 inline bool starts_with(std::string_view value, std::string_view prefix) {
@@ -231,8 +240,7 @@ inline std::string default_model() {
 
     // Legacy install path (scripts/install-weights.sh). Prefer the small model so a copied
     // app defaults to the most compatible complete checkpoint on M1-class machines.
-    const auto root = std::filesystem::path(env_or("HOME", "")) /
-                      "Documents/Magenta/magenta-rt-v2/models";
+    const auto root = magenta_demo::legacy_magenta_models_root();
     const auto small = root / "mrt2_small" / "mrt2_small.mlxfn";
     const auto base  = root / "mrt2_base"  / "mrt2_base.mlxfn";
     if (auto legacy_small = complete_legacy_model_path(small); !legacy_small.empty())
@@ -262,12 +270,12 @@ enum class WorkerLoadOutcome {
     failed,
 };
 
-// Heap engine state shared between the Processor and its worker thread, so the
-// Processor can be destroyed INSTANTLY (detach, no join) even while the worker is
-// mid-model-load. The worker holds a shared_ptr ref, finishes its current op,
-// sees `running=false`, and exits — releasing the state. This keeps host
-// instantiation/teardown fast (auval re-instantiates many times; a join-on-load
-// would make validation crawl / time out).
+inline constexpr int kGenerationStagnationFrameLimit = 12;
+inline constexpr float kGenerationWatchdogEnergyFloor = 1.0e-5f;
+
+// Heap engine state shared between the Processor and its worker thread. The worker
+// owns every MLXEngine call and is joined during Processor teardown so the engine
+// cannot be destroyed while Magenta's asynchronous prompt encoder is still running.
 struct EngineState {
     magentart::core::MLXEngine engine;
     magentart::core::RingBuffer ring_l, ring_r;
@@ -286,6 +294,9 @@ struct EngineState {
     std::array<bool, 128> applied_notes{};
     std::atomic<std::uint64_t> prompt_revision{1};
     std::atomic<std::uint64_t> applied_prompt_revision{0};
+    std::uint64_t previous_generation_signature = 0;
+    int repeated_generation_frames = 0;
+    std::atomic<std::uint64_t> generation_watchdog_resets{0};
 
     // Live model hot-reload. MLX makes streams/encoders thread_local, so the
     // model swap MUST run on the worker thread, not in the UI callback that asks
@@ -335,12 +346,79 @@ struct EngineState {
     }
 };
 
+inline bool generated_frame_has_energy(const float* left,
+                                       const float* right,
+                                       std::size_t frames) {
+    const std::size_t stride = std::max<std::size_t>(1, frames / 64);
+    for (std::size_t i = 0; i < frames; i += stride) {
+        if (std::fabs(left[i]) > kGenerationWatchdogEnergyFloor ||
+            std::fabs(right[i]) > kGenerationWatchdogEnergyFloor)
+            return true;
+    }
+    return false;
+}
+
+inline std::uint64_t generated_frame_signature(const float* left,
+                                               const float* right,
+                                               std::size_t frames) {
+    constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    std::uint64_t hash = kFnvOffset;
+    const std::size_t stride = std::max<std::size_t>(1, frames / 64);
+    auto mix_sample = [&](float sample) {
+        const float clamped = std::clamp(sample, -2.0f, 2.0f);
+        const auto quantized = static_cast<std::int32_t>(std::lrint(clamped * 32767.0f));
+        const auto bits = static_cast<std::uint32_t>(quantized);
+        hash ^= bits & 0xffu;
+        hash *= kFnvPrime;
+        hash ^= (bits >> 8u) & 0xffu;
+        hash *= kFnvPrime;
+        hash ^= (bits >> 16u) & 0xffu;
+        hash *= kFnvPrime;
+        hash ^= (bits >> 24u) & 0xffu;
+        hash *= kFnvPrime;
+    };
+    for (std::size_t i = 0; i < frames; i += stride) {
+        mix_sample(left[i]);
+        mix_sample(right[i]);
+    }
+    return hash;
+}
+
+inline void reset_generation_stagnation_watchdog(EngineState& st) {
+    st.previous_generation_signature = 0;
+    st.repeated_generation_frames = 0;
+}
+
+inline bool update_generation_stagnation_watchdog(EngineState& st,
+                                                  const float* left,
+                                                  const float* right,
+                                                  std::size_t frames) {
+    if (!generated_frame_has_energy(left, right, frames)) {
+        reset_generation_stagnation_watchdog(st);
+        return false;
+    }
+
+    const auto signature = generated_frame_signature(left, right, frames);
+    if (signature == st.previous_generation_signature) {
+        ++st.repeated_generation_frames;
+    } else {
+        st.previous_generation_signature = signature;
+        st.repeated_generation_frames = 0;
+    }
+
+    if (st.repeated_generation_frames < kGenerationStagnationFrameLimit)
+        return false;
+
+    reset_generation_stagnation_watchdog(st);
+    return true;
+}
+
 class Processor : public format::Processor {
 public:
     ~Processor() override {
+        shutdown_worker();
         freeze_sampler_.shutdown();
-        if (st_) st_->running.store(false);
-        if (worker_.joinable()) worker_.detach();   // instant teardown; worker self-exits
     }
 
     format::PluginDescriptor descriptor() const override {
@@ -436,6 +514,8 @@ public:
         sampler_controls.freeze = state().get_value(kFreeze) >= 0.5f;
         sampler_controls.capture_seconds = state().get_value(kCaptureSeconds);
         sampler_controls.loop_crossfade_ms = state().get_value(kLoopCrossfadeMs);
+        sampler_controls.midi = &midi_in;
+        sampler_controls.root_note = 60;
         freeze_sampler_.process(out, sampler_controls);
 
         const float gain = std::pow(10.0f, state().get_value(kVolumeDb) / 20.0f);
@@ -443,6 +523,13 @@ public:
         for (std::size_t ch = 2; ch < nch; ++ch) {
             auto s = out.channel(ch);
             for (std::size_t i = 0; i < ns; ++i) s[i] = L[i];
+        }
+
+        if (package_audit_audio_muted()) {
+            for (std::size_t ch = 0; ch < nch; ++ch) {
+                auto s = out.channel(ch);
+                for (std::size_t i = 0; i < ns; ++i) s[i] = 0.0f;
+            }
         }
     }
 
@@ -554,6 +641,7 @@ public:
         if (st->load_failed.load(std::memory_order_acquire)) {
             switch (static_cast<RuntimeIssue>(st->runtime_issue.load(std::memory_order_acquire))) {
                 case RuntimeIssue::missing_resources:
+                    if (loaded) return {};
                     return "Magenta resources are incomplete. Open Settings > Models to repair the install.";
                 case RuntimeIssue::missing_model_bundle:
                     if (loaded)
@@ -602,6 +690,17 @@ public:
         return sections;
     }
 private:
+    void shutdown_worker() {
+        if (st_) st_->running.store(false, std::memory_order_release);
+        if (!worker_.joinable()) return;
+        if (worker_.get_id() == std::this_thread::get_id()) {
+            worker_.detach();
+            return;
+        }
+        worker_.join();
+        worker_started_.store(false, std::memory_order_release);
+    }
+
     bool model_ready_for_editor() const {
         const auto st = st_;
         if (st && st->loading.load(std::memory_order_acquire))
@@ -631,6 +730,52 @@ private:
         if (!st) return default_prompt();
         std::lock_guard<std::mutex> lk(st->mutex_);
         return st->current_prompt;
+    }
+
+    static bool prompt_encoding_in_flight(const std::shared_ptr<EngineState>& st) {
+        return st->engine.get_text_encoder_status() == 1 ||
+               st->engine.get_quantizer_status() == 1;
+    }
+
+    static bool wait_for_prompt_encoding_idle(const std::shared_ptr<EngineState>& st,
+                                              std::string_view context,
+                                              std::chrono::milliseconds timeout,
+                                              bool timeout_only_while_running) {
+        using namespace std::chrono_literals;
+        const auto start = std::chrono::steady_clock::now();
+        bool logged_shutdown_wait = false;
+        bool logged_slow_wait = false;
+        while (prompt_encoding_in_flight(st)) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = now - start;
+            const bool running = st->running.load(std::memory_order_acquire);
+            if ((!timeout_only_while_running || running) && elapsed > timeout) {
+                magenta_v2_debug_log(std::string(context) + " timed out");
+                return false;
+            }
+            if (!running && !logged_shutdown_wait && elapsed > 250ms) {
+                magenta_v2_debug_log(std::string(context) +
+                                     " still running during shutdown; waiting before engine teardown");
+                logged_shutdown_wait = true;
+            } else if (running && !logged_slow_wait && elapsed > 5s) {
+                magenta_v2_debug_log(std::string(context) + " still running");
+                logged_slow_wait = true;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        return true;
+    }
+
+    static void wait_for_prompt_encoding_idle_before_teardown(
+        const std::shared_ptr<EngineState>& st) {
+        // Magenta's MusicCoCa path owns a detached TFLite thread internally. If
+        // MLXEngine is destroyed first, that thread can jump through a freed
+        // interpreter/tokenizer pointer on app close.
+        (void)wait_for_prompt_encoding_idle(
+            st,
+            "prompt encoder",
+            std::chrono::hours(24),
+            false);
     }
 
     static void apply_realtime_inputs(const std::shared_ptr<EngineState>& st) {
@@ -664,6 +809,26 @@ private:
             apply_prompt_to_engine(st->engine, prompt);
             st->applied_prompt_revision.store(revision, std::memory_order_release);
         }
+    }
+
+    static void recover_stagnant_generation(const std::shared_ptr<EngineState>& st) {
+        std::string prompt;
+        {
+            std::lock_guard<std::mutex> lk(st->mutex_);
+            prompt = st->current_prompt;
+        }
+        apply_prompt_to_engine(st->engine, prompt);
+        st->applied_prompt_revision.store(st->prompt_revision.load(std::memory_order_acquire),
+                                          std::memory_order_release);
+
+        const float base = std::clamp(st->temperature.load(std::memory_order_relaxed),
+                                      0.1f,
+                                      2.0f);
+        const float nudged = base < 1.99f ? base + 0.01f : base - 0.01f;
+        st->engine.set_temperature(nudged);
+        st->engine.set_temperature(base);
+        st->generation_watchdog_resets.fetch_add(1, std::memory_order_relaxed);
+        magenta_v2_debug_log("generation watchdog nudged sampler after repeated output frames");
     }
 
     // Load a checkpoint on THIS (worker) thread — required: MLX streams/encoders
@@ -733,21 +898,18 @@ private:
 
         st->generated_frames.store(0, std::memory_order_relaxed);
         st->underrun_blocks.store(0, std::memory_order_relaxed);
+        reset_generation_stagnation_watchdog(*st);
 
         std::string prompt;
         { std::lock_guard<std::mutex> lk(st->mutex_); prompt = st->current_prompt; }
         apply_prompt_to_engine(st->engine, prompt);
         st->applied_prompt_revision.store(st->prompt_revision.load(std::memory_order_acquire),
                                           std::memory_order_release);
-        const auto encoder_start = std::chrono::steady_clock::now();
-        while (st->running.load() &&
-               (st->engine.get_text_encoder_status() == 1 || st->engine.get_quantizer_status() == 1)) {
-            if (std::chrono::steady_clock::now() - encoder_start > 30s) {
-                magenta_v2_debug_log("encoder startup timed out for '" + path + "'");
-                return fail(RuntimeIssue::encoder_failed, false);
-            }
-            std::this_thread::sleep_for(10ms);
-        }
+        if (!wait_for_prompt_encoding_idle(st,
+                                           "encoder startup for '" + path + "'",
+                                           30s,
+                                           true))
+            return fail(RuntimeIssue::encoder_failed, false);
         if (st->engine.get_text_encoder_status() == 3 || st->engine.get_quantizer_status() == 3) {
             magenta_v2_debug_log("encoder failed after model load for '" + path + "'");
             return fail(RuntimeIssue::encoder_failed, false);
@@ -778,6 +940,8 @@ private:
             st->last_frame_ms.store(
                 std::chrono::duration<float, std::milli>(end - start).count(),
                 std::memory_order_relaxed);
+            if (update_generation_stagnation_watchdog(*st, L, R, mc::kFrameSamples))
+                recover_stagnant_generation(st);
         }
 
         while (st->running.load(std::memory_order_relaxed) &&
@@ -848,7 +1012,8 @@ private:
                 "  download one (mrt2_small or mrt2_base) — it will start playing without a restart.\n");
         float L[mc::kFrameSamples], R[mc::kFrameSamples];
         bool ok = worker_load(st, initial, assets_ok) == WorkerLoadOutcome::loaded;
-        if (ok) ok = prime_output_ring(st, L, R);
+        if (ok && st->running.load(std::memory_order_acquire))
+            ok = prime_output_ring(st, L, R);
         st->loaded.store(ok, std::memory_order_release);
         st->load_failed.store(!ok, std::memory_order_release);
 
@@ -900,6 +1065,7 @@ private:
                              "the instrument will stay silent until the model is reloaded.\n");
             }
         }
+        wait_for_prompt_encoding_idle_before_teardown(st);
     }
 
     std::shared_ptr<EngineState> st_;

@@ -5,6 +5,7 @@
 #include <pulp/audio/loop_types.hpp>
 #include <pulp/audio/published_sample_store.hpp>
 #include <pulp/audio/rolling_audio_capture_buffer.hpp>
+#include <pulp/midi/buffer.hpp>
 #include <pulp/runtime/spsc_queue.hpp>
 
 #include <algorithm>
@@ -30,6 +31,8 @@ struct FreezeLoopSamplerControls {
     bool freeze = false;
     double capture_seconds = 2.0;
     double loop_crossfade_ms = 30.0;
+    const midi::MidiBuffer* midi = nullptr;
+    int root_note = 60;
 };
 
 struct FreezeLoopSamplerStatus {
@@ -82,6 +85,7 @@ public:
 
         materialize_buffer_.resize(config.num_channels, static_cast<std::size_t>(max_frames));
         render_scratch_.resize(config.num_channels, config.max_block_frames);
+        keyed_mix_.resize(config.num_channels, config.max_block_frames);
         publish_ptrs_.assign(config.num_channels, nullptr);
         running_.store(true, std::memory_order_release);
         worker_ = std::thread([this] { worker_loop(); });
@@ -102,6 +106,7 @@ public:
         store_.release();
         capture_.reset();
         renderer_.reset();
+        reset_keyed_voices();
         mode_ = Mode::Live;
         pending_sequence_ = 0;
         active_view_ = {};
@@ -141,7 +146,7 @@ public:
         if (!want_freeze && last_freeze_) begin_release();
         last_freeze_ = want_freeze;
 
-        render_if_needed(live, frames);
+        render_if_needed(live, frames, controls);
     }
 
     FreezeLoopSamplerStatus status() const noexcept {
@@ -161,6 +166,8 @@ public:
 
 private:
     static constexpr std::size_t kMaxChannels = 16;
+    static constexpr std::size_t kMaxKeyedVoices = 8;
+    static constexpr double kSemitoneRatio = 1.0594630943592952646;
 
     enum class Mode : std::uint8_t {
         Live,
@@ -181,6 +188,14 @@ private:
         bool ok = false;
         std::uint64_t frames = 0;
         double loop_crossfade_ms = 30.0;
+    };
+
+    struct KeyedVoice {
+        audio::LoopRenderer renderer;
+        int note = -1;
+        float gain = 0.0f;
+        bool held = false;
+        std::uint64_t age = 0;
     };
 
     static double clamp_double(double value, double lo, double hi) noexcept {
@@ -321,12 +336,18 @@ private:
         if (!renderer_.set_region(region, view.num_frames)) return false;
         renderer_.set_start_fade_frames(0);
         renderer_.set_stop_fade_frames(0);
-        renderer_.set_playback_rate(view.sample_rate > 0.0 ? view.sample_rate / config_.sample_rate : 1.0);
+        base_playback_rate_ = view.sample_rate > 0.0 ? view.sample_rate / config_.sample_rate : 1.0;
+        active_loop_region_ = region;
+        active_source_frames_ = view.num_frames;
+        reset_keyed_voices();
+        renderer_.set_playback_rate(base_playback_rate_);
         renderer_.start();
         return true;
     }
 
-    void render_if_needed(audio::BufferView<float> live, std::uint64_t frames) noexcept {
+    void render_if_needed(audio::BufferView<float> live,
+                          std::uint64_t frames,
+                          const FreezeLoopSamplerControls& controls) noexcept {
         if (mode_ != Mode::FadeToFrozen && mode_ != Mode::Frozen && mode_ != Mode::FadeToLive) {
             return;
         }
@@ -348,8 +369,12 @@ private:
         audio::BufferView<const float> source(source_ptrs.data(),
                                               active_view_.num_channels,
                                               static_cast<std::size_t>(active_view_.num_frames));
-        auto scratch = render_scratch_.view().slice(0, live.num_samples());
-        renderer_.render(source, scratch, frames);
+        handle_keyed_midi(controls);
+        const bool keyed_active = render_keyed_voices_if_active(source, live.num_samples(), frames);
+        auto scratch = keyed_active
+            ? keyed_mix_.view().slice(0, live.num_samples())
+            : render_scratch_.view().slice(0, live.num_samples());
+        if (!keyed_active) renderer_.render(source, scratch, frames);
 
         for (std::uint64_t i = 0; i < frames; ++i) {
             const auto gains = gains_for_next_frame();
@@ -360,6 +385,120 @@ private:
                                             static_cast<double>(frozen_sample) * gains.frozen);
             }
         }
+    }
+
+    static double note_ratio(int note, int root_note) noexcept {
+        return std::pow(kSemitoneRatio, static_cast<double>(note - root_note));
+    }
+
+    void handle_keyed_midi(const FreezeLoopSamplerControls& controls) noexcept {
+        if (controls.midi == nullptr) return;
+        const int root = std::clamp(controls.root_note, 0, 127);
+        for (const auto& event : *controls.midi) {
+            if (event.is_note_on() && event.velocity() > 0) {
+                const int note = static_cast<int>(event.note());
+                start_keyed_voice(note,
+                                  static_cast<float>(event.velocity()) / 127.0f,
+                                  root);
+            } else if (event.is_note_off() || event.is_note_on()) {
+                const int note = static_cast<int>(event.note());
+                stop_keyed_voice(note);
+            }
+        }
+    }
+
+    void start_keyed_voice(int note, float gain, int root_note) noexcept {
+        if (active_source_frames_ < 2) return;
+        auto* voice = find_voice_for_note(note);
+        if (voice == nullptr) voice = find_free_voice();
+        if (voice == nullptr) voice = find_oldest_voice();
+        if (voice == nullptr) return;
+
+        voice->renderer.reset();
+        if (!voice->renderer.set_region(active_loop_region_, active_source_frames_)) {
+            *voice = {};
+            return;
+        }
+        voice->renderer.set_start_fade_frames(std::min<std::uint64_t>(64, active_source_frames_ / 4));
+        voice->renderer.set_stop_fade_frames(std::min<std::uint64_t>(64, active_source_frames_ / 4));
+        voice->renderer.set_playback_rate(clamp_double(base_playback_rate_ * note_ratio(note, root_note),
+                                                       0.03125,
+                                                       32.0));
+        voice->renderer.start();
+        voice->note = note;
+        voice->gain = std::clamp(gain, 0.0f, 1.0f);
+        voice->held = true;
+        voice->age = ++voice_age_counter_;
+    }
+
+    void stop_keyed_voice(int note) noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note == note && voice.held) {
+                voice.held = false;
+                voice.renderer.stop();
+            }
+        }
+    }
+
+    KeyedVoice* find_voice_for_note(int note) noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note == note) return &voice;
+        }
+        return nullptr;
+    }
+
+    KeyedVoice* find_free_voice() noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note < 0 || !voice.renderer.active()) return &voice;
+        }
+        return nullptr;
+    }
+
+    KeyedVoice* find_oldest_voice() noexcept {
+        KeyedVoice* oldest = nullptr;
+        for (auto& voice : keyed_voices_) {
+            if (oldest == nullptr || voice.age < oldest->age) oldest = &voice;
+        }
+        return oldest;
+    }
+
+    bool render_keyed_voices_if_active(audio::BufferView<const float> source,
+                                       std::size_t num_samples,
+                                       std::uint64_t frames) noexcept {
+        bool any_active = false;
+        for (const auto& voice : keyed_voices_) {
+            if (voice.note >= 0 && voice.renderer.active()) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active) return false;
+
+        auto mix = keyed_mix_.view().slice(0, num_samples);
+        mix.clear();
+        auto scratch = render_scratch_.view().slice(0, num_samples);
+        for (auto& voice : keyed_voices_) {
+            if (voice.note < 0 || !voice.renderer.active()) continue;
+            voice.renderer.render(source, scratch, frames);
+            for (std::size_t ch = 0; ch < mix.num_channels(); ++ch) {
+                auto* dst = mix.channel_ptr(ch);
+                const auto* src = ch < scratch.num_channels() ? scratch.channel_ptr(ch) : nullptr;
+                if (src == nullptr) continue;
+                for (std::size_t i = 0; i < num_samples; ++i) {
+                    dst[i] += src[i] * voice.gain;
+                }
+            }
+            if (!voice.renderer.active()) voice = {};
+        }
+        return true;
+    }
+
+    void reset_keyed_voices() noexcept {
+        for (auto& voice : keyed_voices_) {
+            voice.renderer.reset();
+            voice = {};
+        }
+        voice_age_counter_ = 0;
     }
 
     struct MixGains {
@@ -385,6 +524,7 @@ private:
                 mode_ = Mode::Live;
                 frozen_.store(false, std::memory_order_release);
                 renderer_.reset();
+                reset_keyed_voices();
             }
             return {t, 1.0 - t};
         }
@@ -433,14 +573,20 @@ private:
     audio::RollingAudioCaptureBuffer capture_;
     audio::PublishedSampleStore store_;
     audio::LoopRenderer renderer_;
+    std::array<KeyedVoice, kMaxKeyedVoices> keyed_voices_{};
     audio::Buffer<float> materialize_buffer_;
     audio::Buffer<float> render_scratch_;
+    audio::Buffer<float> keyed_mix_;
     std::vector<const float*> publish_ptrs_;
     runtime::SpscQueue<MaterializeJob, 4> jobs_;
     runtime::SpscQueue<MaterializeEvent, 4> events_;
     std::thread worker_;
 
     audio::PublishedSampleView active_view_;
+    audio::LoopRegion active_loop_region_;
+    std::uint64_t active_source_frames_ = 0;
+    double base_playback_rate_ = 1.0;
+    std::uint64_t voice_age_counter_ = 0;
     std::uint64_t pending_sequence_ = 0;
     std::uint64_t fade_position_ = 0;
     std::uint64_t fade_frames_ = 0;

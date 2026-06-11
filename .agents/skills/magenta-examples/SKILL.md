@@ -51,10 +51,65 @@ then runs the real-model smoke (`PULP_MAGENTA_V2_RUN_MODEL_SMOKE=1`) that checks
 freeze/release, hot-switch to another installed model, and rejected incomplete-model reloads that
 must preserve the previous model and audible output.
 
+For any DMG/share build, run the package-isolation DMG script instead of packaging the build-tree
+app directly:
+
+```bash
+./scripts/build-v2-test-dmg.sh
+```
+
+That script runs the Release smoke, builds the V2 Pulp format bundles, creates a DMG, mounts it,
+temporarily hides the CMake build directory, launches the app from the mounted DMG in hidden
+package-audit mode, and fails on dyld/missing-runtime/default-metallib/model-load errors. This is
+the guard against builds that only work because generated dependency artifacts are still available
+in the local build tree. When a Developer ID identity is available, the script signs the staged app
+and DMG; set `PULP_MAGENTA_V2_NOTARIZE=1` with Apple notary credentials for a Gatekeeper-ready share
+build.
+
+For V2 share builds, include the native Pulp plug-in formats in the DMG via a customizable signed
+installer package: Standalone -> `/Applications`, VST3 -> `/Library/Audio/Plug-Ins/VST3`, AUv2 ->
+`/Library/Audio/Plug-Ins/Components`, and CLAP -> `/Library/Audio/Plug-Ins/CLAP`. The standalone app
+can still sit directly in the DMG for drag-run testing. Do not introduce JUCE build files,
+dependencies, or example code for this packaging path.
+
 ## Gotchas (validated)
 
 - The wrapper **pins MLX to `e9e20fa`** (Metal-26 fix). If you re-pin MLX on an existing build,
   delete `_deps/mlx-*` first (a shallow clone can't update to an unrelated SHA).
+- `mlx.metallib` is a required runtime artifact, not a normal dylib. Local builds can appear to
+  work because MLX falls back to a compiled-in build-tree `METAL_PATH`; shipped apps must copy
+  `mlx.metallib` next to each generated executable or into an MLX-supported Resources location,
+  make it readable, and re-sign bundles after every clean copy into a staging root. Treat it as a
+  resource for packaging, but remember that macOS `codesign` treats files under `Contents/MacOS`
+  as nested code. If the packaging script copies bundles with `ditto --noextattr`, it strips the
+  nested signature xattrs from `mlx.metallib`; the copied app/plugin bundle must be re-signed with
+  `codesign --deep` before notarization. This applies both to the DMG-staged app and to every
+  installer component root. Missing this file shows up on other Macs as `Failed to load the default
+  metallib. library not found`; stripped nested signatures show up in notary logs as invalid app
+  binaries inside component packages.
+- Package audits should use `PULP_STANDALONE_PACKAGE_AUDIT=1` instead of relying on a visible app
+  window. The audit should wait for the packaged app to run hidden, initialize audio/model state,
+  and exit cleanly; this avoids screen flashes and catches packaging failures without UI timing
+  assumptions.
+- Hidden package audits must mute generated output by default. They may open the audio device to
+  exercise the real standalone path, but do not let test audio reach speakers unless an explicit
+  audible-smoke env var is set and you have warned the user before launching it.
+- A Developer-ID-signed but unnotarized DMG can still trigger Gatekeeper warnings for other users.
+  For friend/share builds, sign the app/plugin bundles with Developer ID Application, sign
+  installer packages with Developer ID Installer, notarize and staple both `.pkg` and `.dmg`, then
+  run the primary signature `spctl` check before calling it releasable.
+- In Codex/non-interactive shells, direct Developer ID signing can fail with
+  `errSecInternalComponent` or `User interaction is not allowed` even when the same Terminal
+  session works. Prefer the V2 GUI LaunchAgent release-builder path when available: run its signing
+  probe first, then trigger the build with `PULP_STANDALONE_PACKAGE_AUDIT=0` unless the user
+  explicitly opts into an audit that launches CoreAudio. If the probe hangs at `pkgbuild`, the
+  Installer identity still needs keychain ACL/partition-list setup on that Mac.
+- If release signing fails with `errSecInternalComponent`, check for duplicate Developer ID
+  identities in multiple user keychains. Unlock and set the Apple/codesign partition list on every
+  matching keychain before rerunning the release script, because `codesign` can select a locked
+  duplicate. For V2, pin the scripts to the intended keychain with
+  `PULP_MAGENTA_V2_CODESIGN_KEYCHAIN` and `PULP_MAGENTA_V2_INSTALLER_KEYCHAIN` when one duplicate
+  keychain has an unknown or stale password.
 - MRT2 is **generative, ~200 ms latency** — MIDI steers; it does not deterministically play notes.
   Set that expectation in any UX copy.
 - Keep **all MLXEngine mutation on one worker thread**. MLX streams/Metal command encoders are

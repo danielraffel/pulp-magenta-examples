@@ -10,6 +10,7 @@ pulp_add_plugin(PromptableAccompanistV2
     MANUFACTURER      "PulpMagenta"
     VERSION           "0.1.0"
     CATEGORY          Instrument
+    ACCEPTS_MIDI
     PLUGIN_CODE       "PMa2"
     MANUFACTURER_CODE "PuMa"
 )
@@ -20,6 +21,50 @@ target_link_libraries(PromptableAccompanistV2_Core
         Pulp::audio
         Pulp::view
 )
+
+# MLX builds its Metal kernels into mlx.metallib but does not embed that file
+# into Pulp bundles automatically. The runtime first looks next to the current
+# binary, so copy the metallib beside every V2 bundle executable we generate.
+set(PROMPTABLE_ACCOMPANIST_V2_MLX_METALLIB
+    "${CMAKE_BINARY_DIR}/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib")
+find_program(PROMPTABLE_ACCOMPANIST_V2_CODESIGN codesign)
+
+function(promptable_accompanist_v2_copy_mlx_metallib target_name)
+    if(NOT TARGET ${target_name})
+        return()
+    endif()
+    if(TARGET mlx-metallib)
+        add_dependencies(${target_name} mlx-metallib)
+    endif()
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROMPTABLE_ACCOMPANIST_V2_MLX_METALLIB}"
+            "$<TARGET_FILE_DIR:${target_name}>/mlx.metallib"
+        COMMAND /bin/chmod 0644 "$<TARGET_FILE_DIR:${target_name}>/mlx.metallib"
+        COMMENT "Copying MLX Metal kernels for ${target_name}"
+        VERBATIM
+    )
+    if(PROMPTABLE_ACCOMPANIST_V2_CODESIGN)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND "${PROMPTABLE_ACCOMPANIST_V2_CODESIGN}" --force --deep --sign -
+                "$<TARGET_BUNDLE_DIR:${target_name}>"
+            COMMENT "Ad-hoc signing ${target_name} after MLX resource copy"
+            VERBATIM
+        )
+    endif()
+endfunction()
+
+foreach(target_name
+    PromptableAccompanistV2_Standalone
+    PromptableAccompanistV2_CLAP
+    PromptableAccompanistV2_VST3
+    PromptableAccompanistV2_AU
+    PromptableAccompanistV2_AUv3
+    PromptableAccompanistV2_AUv3Framework
+    PromptableAccompanistV2_AUv3Host
+)
+    promptable_accompanist_v2_copy_mlx_metallib(${target_name})
+endforeach()
 
 # V2 is GPU-native only for now. The WebView A/B track stays in E1 while this example
 # exercises reusable sampler primitives and the native controls needed for freeze/loop.

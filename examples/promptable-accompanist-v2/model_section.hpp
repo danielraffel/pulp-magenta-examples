@@ -9,6 +9,8 @@
 #include <pulp/view/view.hpp>
 #include <pulp/view/model_manager_view.hpp>
 #include <pulp/view/frame_clock.hpp>
+#include <pulp/view/buttons.hpp>
+#include <pulp/view/file_browser.hpp>
 #include <pulp/runtime/model_store.hpp>
 #include <pulp/runtime/model_download.hpp>
 #include <pulp/runtime/async_stream.hpp>
@@ -22,7 +24,9 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <vector>
 
 namespace magenta_demo {
 
@@ -45,7 +49,7 @@ public:
 private:
     static pulp::runtime::ModelListResult list_magenta_models() {
         auto result = pulp::runtime::list_models(magenta_models(), kMagentaSubsystem);
-        const bool resources_ok = runtime_resources_complete();
+        const bool resources_ok = runtime_resources_available();
         for (auto& listed : result.models) {
             if (listed.status != "installed") continue;
             if (!resources_ok ||
@@ -63,16 +67,135 @@ private:
     static bool active_model_complete(const std::string& id) {
         if (id.empty()) return false;
         const auto rec = pulp::runtime::read_installed_model(kMagentaSubsystem, id);
-        return rec.metadata_found && runtime_resources_complete() &&
+        return rec.metadata_found && runtime_resources_available() &&
                magenta_model_bundle_complete(rec.resolved_checkpoint_path);
+    }
+
+    static constexpr pulp::canvas::Color kMuted() {
+        return pulp::canvas::Color::rgba8(170, 170, 175, 255);
+    }
+
+    static constexpr pulp::canvas::Color kWhite() {
+        return pulp::canvas::Color::rgba8(235, 235, 240, 255);
+    }
+
+    static constexpr pulp::canvas::Color kPanel() {
+        return pulp::canvas::Color::rgba8(32, 33, 36, 255);
+    }
+
+    static std::unique_ptr<pulp::view::Label> make_label(const std::string& text,
+                                                         float size,
+                                                         pulp::canvas::Color color) {
+        auto label = std::make_unique<pulp::view::Label>(text);
+        label->set_font_size(size);
+        label->set_text_color(color);
+        return label;
+    }
+
+    static bool complete_model_at(const std::filesystem::path& root,
+                                  const std::string& model_id) {
+        return magenta_model_bundle_complete(root / model_id / (model_id + ".mlxfn"));
+    }
+
+    static std::string detected_model_summary(const std::filesystem::path& root) {
+        std::vector<std::string> names;
+        if (complete_model_at(root, "mrt2_small")) names.push_back("Small");
+        if (complete_model_at(root, "mrt2_base")) names.push_back("Large");
+
+        if (names.empty()) return "No complete MRT2 models detected";
+        if (names.size() == 1) return names.front() + " detected";
+        return names[0] + " and " + names[1] + " detected";
+    }
+
+    static std::filesystem::path nearest_existing_directory(std::filesystem::path path) {
+        std::error_code ec;
+        if (path.empty()) return {};
+        if (std::filesystem::is_regular_file(path, ec)) path = path.parent_path();
+        for (;;) {
+            ec.clear();
+            if (std::filesystem::is_directory(path, ec)) return path;
+            const auto parent = path.parent_path();
+            if (parent.empty() || parent == path) return {};
+            path = parent;
+        }
+    }
+
+    static void open_folder(const std::filesystem::path& path) {
+        if (const auto target = nearest_existing_directory(path); !target.empty())
+            pulp::view::ContentSharer::share_file(target);
+    }
+
+    static std::unique_ptr<pulp::view::TextButton> make_open_button(
+        const std::filesystem::path& path) {
+        auto button = std::make_unique<pulp::view::TextButton>("Open Folder");
+        button->flex().preferred_width = 112.0f;
+        button->flex().preferred_height = 28.0f;
+        button->set_enabled(!path.empty());
+        button->on_click = [path] { open_folder(path); };
+        return button;
+    }
+
+    static std::unique_ptr<pulp::view::View> make_storage_row(
+        const std::string& title,
+        const std::filesystem::path& path) {
+        auto row = std::make_unique<pulp::view::View>();
+        row->flex().direction = pulp::view::FlexDirection::row;
+        row->flex().align_items = pulp::view::FlexAlign::center;
+        row->flex().gap = 10.0f;
+        row->flex().preferred_height = 48.0f;
+
+        auto text = std::make_unique<pulp::view::View>();
+        text->flex().direction = pulp::view::FlexDirection::column;
+        text->flex().gap = 2.0f;
+        text->flex().flex_grow = 1.0f;
+        auto title_label = make_label(title + " - " + detected_model_summary(path),
+                                      12.0f,
+                                      kWhite());
+        title_label->set_font_weight(700);
+        text->add_child(std::move(title_label));
+        text->add_child(make_label(path.empty() ? "(unavailable)" : path.string(), 10.0f, kMuted()));
+
+        row->add_child(std::move(text));
+        row->add_child(make_open_button(path));
+        return row;
+    }
+
+    std::unique_ptr<pulp::view::View> make_storage_section() {
+        auto section = std::make_unique<pulp::view::View>();
+        section->flex().direction = pulp::view::FlexDirection::column;
+        section->flex().gap = 8.0f;
+        section->flex().padding_left = 20.0f;
+        section->flex().padding_right = 20.0f;
+        section->flex().padding_bottom = 20.0f;
+        section->set_background_color(kPanel());
+
+        auto heading = make_label("Model files", 14.0f, kWhite());
+        heading->set_font_weight(700);
+        section->add_child(std::move(heading));
+        section->add_child(make_storage_row(
+            "Model folder",
+            pulp::runtime::resolve_pulp_home() / kMagentaSubsystem / "models"));
+        return section;
+    }
+
+    void refresh_storage_section() {
+        if (storage_section_) {
+            remove_child(storage_section_);
+            storage_section_ = nullptr;
+        }
+        auto storage = make_storage_section();
+        storage_section_ = storage.get();
+        add_child(std::move(storage));
     }
 
     void refresh_list() {
         if (manager_) manager_->set_models(list_magenta_models());
+        refresh_storage_section();
     }
 
     void build() {
         while (child_count() > 0) remove_child(child_at(0));
+        storage_section_ = nullptr;
         auto mgr = std::make_unique<pulp::view::ModelManagerView>();
         mgr->on_download = [this](const std::string& id) { start_download(id); };
         mgr->on_activate = [this](const std::string& id) {
@@ -92,6 +215,7 @@ private:
         mgr->set_can_close(false);  // the host Settings panel owns navigation
         if (downloading_.load()) mgr->set_download_progress(active_dl_id_, progress_.load());
         add_child(std::move(mgr));
+        refresh_storage_section();
     }
 
     bool tick(float /*dt*/) {
@@ -187,6 +311,7 @@ private:
 
     std::function<void()> on_model_changed_;
     pulp::view::ModelManagerView* manager_ = nullptr;
+    pulp::view::View* storage_section_ = nullptr;
     std::thread worker_;
     pulp::runtime::CancellationToken cancel_;
     std::atomic<bool> downloading_{false};

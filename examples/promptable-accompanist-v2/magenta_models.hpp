@@ -15,6 +15,7 @@
 #include <pulp/runtime/model_registry.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <system_error>
@@ -23,6 +24,22 @@
 namespace magenta_demo {
 
 inline constexpr char kMagentaSubsystem[] = "magenta";
+
+inline std::filesystem::path magenta_user_home() {
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return std::filesystem::path(home);
+#ifdef _WIN32
+    if (const char* profile = std::getenv("USERPROFILE"); profile && *profile)
+        return std::filesystem::path(profile);
+#endif
+    return {};
+}
+
+inline std::filesystem::path legacy_magenta_models_root() {
+    const auto home = magenta_user_home();
+    if (home.empty()) return {};
+    return home / "Documents/Magenta/magenta-rt-v2/models";
+}
 
 inline const std::vector<pulp::runtime::ModelEntry>& magenta_models() {
     using pulp::runtime::ModelAsset;

@@ -76,6 +76,11 @@ private:
         return status.find("Settings > Models") != std::string_view::npos;
     }
 
+    static bool transient_editor_status(std::string_view status) {
+        return status == "Loading Magenta model..." ||
+               status == "Model loaded; warming up generated audio...";
+    }
+
     bool model_ready_now() const {
         return model_ready_ && model_ready_();
     }
@@ -260,7 +265,8 @@ private:
         })));
         const std::string status = runtime_status_now();
         last_runtime_status_ = status;
-        if (!status.empty()) add_child(make_status_banner(status));
+        if (!status.empty() && !transient_editor_status(status))
+            add_child(make_status_banner(status));
 
         if (!native_ui_held_) {
             auto set_prompt_persist = [this](const std::string& p) {
