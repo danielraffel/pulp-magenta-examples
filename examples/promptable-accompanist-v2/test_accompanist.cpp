@@ -727,6 +727,95 @@ int check_package_audit_mutes_generated_audio_by_default() {
     return 0;
 }
 
+int check_frozen_loop_state_round_trip() {
+    FreezeLoopSamplerSnapshot snapshot;
+    snapshot.num_channels = 2;
+    snapshot.num_frames = 128;
+    snapshot.sample_rate = 48000.0;
+    snapshot.loop_crossfade_ms = 0.0;
+    snapshot.planar_samples.assign(static_cast<std::size_t>(snapshot.num_channels *
+                                                            snapshot.num_frames),
+                                   0.25f);
+
+    const auto blob = serialize_frozen_loop_snapshot(snapshot);
+    CHECK(!blob.empty(), "frozen loop snapshot serializes");
+    const auto decoded = deserialize_frozen_loop_snapshot(blob);
+    CHECK(decoded.has_value(), "frozen loop snapshot deserializes");
+    CHECK(decoded->num_channels == snapshot.num_channels,
+          "frozen loop snapshot preserves channel count");
+    CHECK(decoded->num_frames == snapshot.num_frames,
+          "frozen loop snapshot preserves frame count");
+    CHECK(decoded->planar_samples == snapshot.planar_samples,
+          "frozen loop snapshot preserves audio samples");
+
+    FreezeLoopSampler sampler;
+    FreezeLoopSamplerConfig config;
+    config.num_channels = 2;
+    config.sample_rate = 48000.0;
+    config.max_block_frames = 64;
+    config.max_capture_seconds = 0.25;
+    config.sample_slots = 2;
+    CHECK(sampler.prepare(config), "snapshot restore sampler prepares");
+    CHECK(sampler.restore_frozen_snapshot(snapshot),
+          "snapshot restore publishes a frozen loop");
+
+    pulp::audio::Buffer<float> block(2, 64);
+    FreezeLoopSamplerControls controls;
+    controls.freeze = true;
+    controls.capture_seconds = 0.05;
+    controls.loop_crossfade_ms = 0.0;
+    const auto restored_error = process_constant_blocks_and_measure_error(sampler,
+                                                                          block,
+                                                                          controls,
+                                                                          0.0f,
+                                                                          0.25,
+                                                                          0,
+                                                                          4);
+    CHECK(restored_error < 0.001,
+          "snapshot-restored sampler renders the persisted loop");
+    sampler.shutdown();
+
+    const auto home = unique_temp_dir("pulp-magenta-v2-frozen-state");
+    const auto pulp_home = home / ".pulp";
+    const auto home_string = home.string();
+    const auto pulp_home_string = pulp_home.string();
+    EnvGuard home_guard("HOME", home_string.c_str());
+    EnvGuard pulp_home_guard("PULP_HOME", pulp_home_string.c_str());
+    EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+
+    Processor processor;
+    pulp::state::StateStore state;
+    processor.set_state_store(&state);
+    processor.define_parameters(state);
+    state.set_value(kFreeze, 1.0f);
+    state.set_value(kVolumeDb, 0.0f);
+    CHECK(processor.deserialize_plugin_state(blob),
+          "processor accepts a frozen loop payload before prepare");
+
+    pulp::format::PrepareContext prepare;
+    prepare.sample_rate = 48000.0;
+    prepare.max_buffer_size = 64;
+    prepare.input_channels = 0;
+    prepare.output_channels = 2;
+    processor.prepare(prepare);
+
+    pulp::audio::Buffer<float> output(2, 64);
+    std::uint64_t block_index = 0;
+    process_runtime_block(processor, output, block_index++);
+    CHECK(processor.freeze_sampler_status().frozen,
+          "processor restores frozen sampler state during prepare");
+    CHECK(max_abs_error_from(output, 0.25) < 0.001,
+          "processor renders restored frozen audio after state recall");
+    CHECK(!processor.serialize_plugin_state().empty(),
+          "processor reserializes restored frozen audio while Freeze is on");
+    state.set_value(kFreeze, 0.0f);
+    CHECK(processor.serialize_plugin_state().empty(),
+          "processor omits frozen audio payload when Freeze is off");
+    processor.release();
+    std::filesystem::remove_all(home);
+    return 0;
+}
+
 std::string alternate_model_path_for_runtime_smoke(const std::string& current) {
     const auto shared = pulp::runtime::resolve_pulp_home() / "magenta/models";
     const auto legacy = magenta_demo::legacy_magenta_models_root();
@@ -935,6 +1024,8 @@ int main() {
     if (generation_watchdog_result != 0) return generation_watchdog_result;
     const int package_audit_audio_result = check_package_audit_mutes_generated_audio_by_default();
     if (package_audit_audio_result != 0) return package_audit_audio_result;
+    const int frozen_loop_state_result = check_frozen_loop_state_round_trip();
+    if (frozen_loop_state_result != 0) return frozen_loop_state_result;
 
     Processor p;
     auto d = p.descriptor();

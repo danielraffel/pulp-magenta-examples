@@ -14,6 +14,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -48,6 +51,14 @@ struct FreezeLoopSamplerStatus {
     std::uint64_t buffer_shape_mismatches = 0;
 };
 
+struct FreezeLoopSamplerSnapshot {
+    std::uint32_t num_channels = 0;
+    std::uint64_t num_frames = 0;
+    double sample_rate = 0.0;
+    double loop_crossfade_ms = 30.0;
+    std::vector<float> planar_samples;
+};
+
 // Host lifecycle calls must be serialized against process(); process() owns the
 // real-time state once prepare() succeeds.
 class FreezeLoopSampler {
@@ -59,6 +70,9 @@ public:
     ~FreezeLoopSampler() { shutdown(); }
 
     bool prepare(const FreezeLoopSamplerConfig& config) {
+        const auto preserved_snapshot = frozen_.load(std::memory_order_acquire)
+            ? frozen_snapshot()
+            : std::optional<FreezeLoopSamplerSnapshot>{};
         shutdown();
         if (config.num_channels == 0 || config.num_channels > kMaxChannels ||
             config.sample_rate <= 0.0 || !std::isfinite(config.sample_rate) ||
@@ -90,6 +104,7 @@ public:
         running_.store(true, std::memory_order_release);
         worker_ = std::thread([this] { worker_loop(); });
         prepared_.store(true, std::memory_order_release);
+        if (preserved_snapshot) restore_frozen_snapshot(*preserved_snapshot);
         return true;
     }
 
@@ -164,6 +179,78 @@ public:
         };
     }
 
+    std::optional<FreezeLoopSamplerSnapshot> frozen_snapshot() const {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        if (!persisted_snapshot_) return std::nullopt;
+        return persisted_snapshot_;
+    }
+
+    bool restore_frozen_snapshot(const FreezeLoopSamplerSnapshot& snapshot) {
+        if (!prepared_.load(std::memory_order_acquire) || !snapshot_valid(snapshot))
+            return false;
+
+        const auto frames = static_cast<std::size_t>(snapshot.num_frames);
+        for (std::uint32_t ch = 0; ch < snapshot.num_channels; ++ch) {
+            publish_ptrs_[ch] = snapshot.planar_samples.data() + frames * ch;
+        }
+        const audio::BufferView<const float> publish_view(publish_ptrs_.data(),
+                                                          snapshot.num_channels,
+                                                          frames);
+        if (!store_.publish(publish_view,
+                            snapshot.num_frames,
+                            snapshot.sample_rate,
+                            audio_safe_generation_.load(std::memory_order_acquire))) {
+            return false;
+        }
+
+        const auto view = store_.read_published_view();
+        if (!configure_renderer(view, snapshot.loop_crossfade_ms)) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_ = snapshot;
+        }
+
+        active_view_ = view;
+        audio_safe_generation_.store(active_view_.generation, std::memory_order_release);
+        sample_frames_.store(snapshot.num_frames, std::memory_order_relaxed);
+        captures_completed_.fetch_add(1, std::memory_order_relaxed);
+        pending_.store(false, std::memory_order_release);
+        hold_active_.store(false, std::memory_order_release);
+        freeze_requested_.store(true, std::memory_order_release);
+        retry_freeze_after_pending_ = false;
+        pending_cancelled_ = false;
+        last_freeze_ = true;
+        fade_position_ = 0;
+        fade_frames_ = 0;
+        mode_ = Mode::Frozen;
+        frozen_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void clear_frozen_snapshot() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_.reset();
+        }
+        active_view_ = {};
+        active_loop_region_ = {};
+        active_source_frames_ = 0;
+        renderer_.reset();
+        reset_keyed_voices();
+        sample_frames_.store(0, std::memory_order_relaxed);
+        frozen_.store(false, std::memory_order_release);
+        freeze_requested_.store(false, std::memory_order_release);
+        pending_.store(false, std::memory_order_release);
+        hold_active_.store(false, std::memory_order_release);
+        mode_ = Mode::Live;
+        last_freeze_ = false;
+        retry_freeze_after_pending_ = false;
+        pending_cancelled_ = false;
+        fade_position_ = 0;
+        fade_frames_ = 0;
+    }
+
 private:
     static constexpr std::size_t kMaxChannels = 16;
     static constexpr std::size_t kMaxKeyedVoices = 8;
@@ -201,6 +288,59 @@ private:
     static double clamp_double(double value, double lo, double hi) noexcept {
         if (!std::isfinite(value)) return lo;
         return std::clamp(value, lo, hi);
+    }
+
+    bool snapshot_valid(const FreezeLoopSamplerSnapshot& snapshot) const noexcept {
+        if (snapshot.num_channels == 0 ||
+            snapshot.num_channels > config_.num_channels ||
+            snapshot.num_channels > kMaxChannels ||
+            snapshot.num_frames < 2 ||
+            snapshot.num_frames > store_.max_frames_per_slot() ||
+            !(snapshot.sample_rate > 0.0) ||
+            !std::isfinite(snapshot.sample_rate) ||
+            !std::isfinite(snapshot.loop_crossfade_ms)) {
+            return false;
+        }
+        if (snapshot.num_frames > std::numeric_limits<std::size_t>::max() /
+                                      snapshot.num_channels) {
+            return false;
+        }
+        const auto expected = static_cast<std::size_t>(snapshot.num_frames) *
+                              static_cast<std::size_t>(snapshot.num_channels);
+        return snapshot.planar_samples.size() == expected;
+    }
+
+    void remember_frozen_snapshot(audio::BufferView<const float> source,
+                                  std::uint64_t frames,
+                                  double sample_rate,
+                                  double loop_crossfade_ms) noexcept {
+        if (source.num_channels() == 0 ||
+            source.num_channels() > kMaxChannels ||
+            frames < 2 ||
+            frames > std::numeric_limits<std::size_t>::max() ||
+            source.num_samples() < static_cast<std::size_t>(frames) ||
+            !(sample_rate > 0.0) ||
+            !std::isfinite(sample_rate)) {
+            return;
+        }
+
+        FreezeLoopSamplerSnapshot snapshot;
+        snapshot.num_channels = static_cast<std::uint32_t>(source.num_channels());
+        snapshot.num_frames = frames;
+        snapshot.sample_rate = sample_rate;
+        snapshot.loop_crossfade_ms = loop_crossfade_ms;
+        try {
+            const auto frame_count = static_cast<std::size_t>(frames);
+            snapshot.planar_samples.resize(frame_count * source.num_channels());
+            for (std::size_t ch = 0; ch < source.num_channels(); ++ch) {
+                const auto* src = source.channel_ptr(ch);
+                auto* dst = snapshot.planar_samples.data() + frame_count * ch;
+                std::copy(src, src + frame_count, dst);
+            }
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_ = std::move(snapshot);
+        } catch (...) {
+        }
     }
 
     void begin_freeze(const FreezeLoopSamplerControls& controls) noexcept {
@@ -558,6 +698,12 @@ private:
                                     result.frames_copied,
                                     config_.sample_rate,
                                     audio_safe_generation_.load(std::memory_order_acquire));
+                if (ok) {
+                    remember_frozen_snapshot(publish_view,
+                                             result.frames_copied,
+                                             config_.sample_rate,
+                                             job->loop_crossfade_ms);
+                }
             }
             MaterializeEvent event{job->sequence,
                                    ok,
@@ -581,6 +727,8 @@ private:
     runtime::SpscQueue<MaterializeJob, 4> jobs_;
     runtime::SpscQueue<MaterializeEvent, 4> events_;
     std::thread worker_;
+    mutable std::mutex snapshot_mutex_;
+    std::optional<FreezeLoopSamplerSnapshot> persisted_snapshot_;
 
     audio::PublishedSampleView active_view_;
     audio::LoopRegion active_loop_region_;

@@ -49,13 +49,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -414,6 +419,162 @@ inline bool update_generation_stagnation_watchdog(EngineState& st,
     return true;
 }
 
+inline constexpr std::array<std::uint8_t, 8> kFrozenLoopStateMagic{
+    'P', 'A', 'V', '2', 'F', 'R', 'Z', '1'};
+inline constexpr std::uint32_t kFrozenLoopStateVersion = 1;
+inline constexpr std::uint64_t kMaxFrozenLoopSerializedBytes = 64ull * 1024ull * 1024ull;
+
+inline void append_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((value >> 8u) & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((value >> 16u) & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((value >> 24u) & 0xffu));
+}
+
+inline void append_u64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8)
+        out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xffu));
+}
+
+inline std::uint64_t double_bits(double value) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline std::uint32_t float_bits(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline double double_from_bits(std::uint64_t bits) {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline float float_from_bits(std::uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline bool read_u32(std::span<const std::uint8_t> data,
+                     std::size_t& cursor,
+                     std::uint32_t& value) {
+    if (cursor > data.size() || data.size() - cursor < 4) return false;
+    value = static_cast<std::uint32_t>(data[cursor]) |
+            (static_cast<std::uint32_t>(data[cursor + 1]) << 8u) |
+            (static_cast<std::uint32_t>(data[cursor + 2]) << 16u) |
+            (static_cast<std::uint32_t>(data[cursor + 3]) << 24u);
+    cursor += 4;
+    return true;
+}
+
+inline bool read_u64(std::span<const std::uint8_t> data,
+                     std::size_t& cursor,
+                     std::uint64_t& value) {
+    if (cursor > data.size() || data.size() - cursor < 8) return false;
+    value = 0;
+    for (int shift = 0; shift < 64; shift += 8)
+        value |= static_cast<std::uint64_t>(data[cursor++]) << shift;
+    return true;
+}
+
+inline std::vector<std::uint8_t> serialize_frozen_loop_snapshot(
+    const FreezeLoopSamplerSnapshot& snapshot) {
+    if (snapshot.num_channels == 0 ||
+        snapshot.num_channels > 16 ||
+        snapshot.num_frames < 2 ||
+        snapshot.num_frames > std::numeric_limits<std::size_t>::max() / snapshot.num_channels ||
+        !(snapshot.sample_rate > 0.0) ||
+        !std::isfinite(snapshot.sample_rate) ||
+        !std::isfinite(snapshot.loop_crossfade_ms)) {
+        return {};
+    }
+    const auto expected_samples = static_cast<std::uint64_t>(snapshot.num_channels) *
+                                  snapshot.num_frames;
+    if (snapshot.planar_samples.size() != expected_samples ||
+        expected_samples > kMaxFrozenLoopSerializedBytes / sizeof(float)) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> out;
+    try {
+        out.reserve(kFrozenLoopStateMagic.size() + 4u + 4u + 8u + 8u + 8u + 8u +
+                    snapshot.planar_samples.size() * 4u);
+        out.insert(out.end(), kFrozenLoopStateMagic.begin(), kFrozenLoopStateMagic.end());
+        append_u32(out, kFrozenLoopStateVersion);
+        append_u32(out, snapshot.num_channels);
+        append_u64(out, snapshot.num_frames);
+        append_u64(out, double_bits(snapshot.sample_rate));
+        append_u64(out, double_bits(snapshot.loop_crossfade_ms));
+        append_u64(out, expected_samples);
+        for (const auto sample : snapshot.planar_samples)
+            append_u32(out, float_bits(sample));
+    } catch (...) {
+        return {};
+    }
+    return out;
+}
+
+inline std::optional<FreezeLoopSamplerSnapshot> deserialize_frozen_loop_snapshot(
+    std::span<const std::uint8_t> data) {
+    if (data.size() < kFrozenLoopStateMagic.size()) return std::nullopt;
+    if (!std::equal(kFrozenLoopStateMagic.begin(), kFrozenLoopStateMagic.end(), data.begin()))
+        return std::nullopt;
+
+    std::size_t cursor = kFrozenLoopStateMagic.size();
+    std::uint32_t version = 0;
+    std::uint32_t channels = 0;
+    std::uint64_t frames = 0;
+    std::uint64_t sample_rate_bits = 0;
+    std::uint64_t xfade_bits = 0;
+    std::uint64_t sample_count = 0;
+    if (!read_u32(data, cursor, version) ||
+        !read_u32(data, cursor, channels) ||
+        !read_u64(data, cursor, frames) ||
+        !read_u64(data, cursor, sample_rate_bits) ||
+        !read_u64(data, cursor, xfade_bits) ||
+        !read_u64(data, cursor, sample_count)) {
+        return std::nullopt;
+    }
+    if (version != kFrozenLoopStateVersion ||
+        channels == 0 ||
+        channels > 16 ||
+        frames < 2 ||
+        frames > std::numeric_limits<std::size_t>::max() / channels ||
+        sample_count != frames * static_cast<std::uint64_t>(channels) ||
+        sample_count > kMaxFrozenLoopSerializedBytes / sizeof(float) ||
+        data.size() - cursor != sample_count * 4u) {
+        return std::nullopt;
+    }
+
+    FreezeLoopSamplerSnapshot snapshot;
+    snapshot.num_channels = channels;
+    snapshot.num_frames = frames;
+    snapshot.sample_rate = double_from_bits(sample_rate_bits);
+    snapshot.loop_crossfade_ms = double_from_bits(xfade_bits);
+    if (!(snapshot.sample_rate > 0.0) ||
+        !std::isfinite(snapshot.sample_rate) ||
+        !std::isfinite(snapshot.loop_crossfade_ms)) {
+        return std::nullopt;
+    }
+
+    try {
+        snapshot.planar_samples.resize(static_cast<std::size_t>(sample_count));
+    } catch (...) {
+        return std::nullopt;
+    }
+    for (auto& sample : snapshot.planar_samples) {
+        std::uint32_t bits = 0;
+        if (!read_u32(data, cursor, bits)) return std::nullopt;
+        sample = float_from_bits(bits);
+    }
+    return snapshot;
+}
+
 class Processor : public format::Processor {
 public:
     ~Processor() override {
@@ -457,6 +618,10 @@ public:
         sampler_config.max_capture_seconds = 8.0;
         sampler_config.sample_slots = 2;
         freeze_sampler_.prepare(sampler_config);
+        if (pending_frozen_snapshot_) {
+            if (freeze_sampler_.restore_frozen_snapshot(*pending_frozen_snapshot_))
+                pending_frozen_snapshot_.reset();
+        }
         if (!worker_started_.exchange(true)) {
             st_ = std::make_shared<EngineState>();
             st_->current_prompt = default_prompt();  // before worker loads
@@ -465,6 +630,30 @@ public:
             auto st = st_;                                 // worker holds a ref
             worker_ = std::thread([st] { worker_run(st); });
         }
+    }
+
+    std::vector<std::uint8_t> serialize_plugin_state() const override {
+        if (state().get_value(kFreeze) < 0.5f) return {};
+        const auto snapshot = freeze_sampler_.frozen_snapshot();
+        if (!snapshot) return {};
+        return serialize_frozen_loop_snapshot(*snapshot);
+    }
+
+    bool deserialize_plugin_state(std::span<const std::uint8_t> data) override {
+        if (data.empty()) {
+            pending_frozen_snapshot_.reset();
+            freeze_sampler_.clear_frozen_snapshot();
+            return true;
+        }
+        auto snapshot = deserialize_frozen_loop_snapshot(data);
+        if (!snapshot) return false;
+        if (freeze_sampler_.status().prepared) {
+            if (!freeze_sampler_.restore_frozen_snapshot(*snapshot)) return false;
+            pending_frozen_snapshot_.reset();
+        } else {
+            pending_frozen_snapshot_ = std::move(snapshot);
+        }
+        return true;
     }
 
     void process(audio::BufferView<float>& out,
@@ -1073,6 +1262,7 @@ private:
     std::atomic<bool> worker_started_{false};
     double sample_rate_ = 48000.0;
     FreezeLoopSampler freeze_sampler_;
+    std::optional<FreezeLoopSamplerSnapshot> pending_frozen_snapshot_;
     magenta_demo::AccompanistRoot* editor_ = nullptr;  // refreshed when the active model changes
 };
 
