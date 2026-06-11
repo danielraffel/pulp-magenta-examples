@@ -1108,6 +1108,23 @@ int check_hosted_clap_frozen_loop_state_round_trip(
 #endif
 }
 
+int dump_clap_adapter_frozen_loop_state_if_requested(
+    const std::vector<std::uint8_t>& frozen_blob) {
+    const char* output_path = std::getenv("PULP_MAGENTA_V2_DUMP_CLAP_STATE");
+    if (!output_path || !*output_path) return 0;
+
+    std::vector<std::uint8_t> saved_state;
+    const int save_result = save_clap_adapter_frozen_loop_state(frozen_blob, saved_state);
+    if (save_result != 0) return save_result;
+
+    std::ofstream output(output_path, std::ios::binary);
+    CHECK(output.is_open(), "dump CLAP frozen loop state opens output file");
+    output.write(reinterpret_cast<const char*>(saved_state.data()),
+                 static_cast<std::streamsize>(saved_state.size()));
+    CHECK(output.good(), "dump CLAP frozen loop state writes output file");
+    return 0;
+}
+
 #if defined(__APPLE__)
 int check_auv2_adapter_frozen_loop_state_round_trip(
     const std::vector<std::uint8_t>& frozen_blob,
@@ -1162,6 +1179,10 @@ int check_adapter_frozen_loop_state_round_trip() {
     const int hosted_clap_result =
         check_hosted_clap_frozen_loop_state_round_trip(frozen_blob, kExpectedSample);
     if (hosted_clap_result != 0) return hosted_clap_result;
+
+    const int dump_clap_result =
+        dump_clap_adapter_frozen_loop_state_if_requested(frozen_blob);
+    if (dump_clap_result != 0) return dump_clap_result;
 
 #if defined(__APPLE__)
     const int auv2_result =
