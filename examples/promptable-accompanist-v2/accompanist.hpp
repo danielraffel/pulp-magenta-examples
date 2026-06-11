@@ -136,6 +136,10 @@ inline bool package_audit_audio_muted() {
            !env_truthy("PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO");
 }
 
+inline bool magenta_v2_worker_disabled() {
+    return env_truthy("PULP_MAGENTA_V2_TEST_DISABLE_WORKER");
+}
+
 inline bool starts_with(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
@@ -627,8 +631,12 @@ public:
             st_->current_prompt = default_prompt();  // before worker loads
             st_->ring_l.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
             st_->ring_r.set_virtual_capacity(magentart::core::RingBuffer::kCapacity);
-            auto st = st_;                                 // worker holds a ref
-            worker_ = std::thread([st] { worker_run(st); });
+            if (magenta_v2_worker_disabled()) {
+                worker_started_.store(false, std::memory_order_release);
+            } else {
+                auto st = st_;                             // worker holds a ref
+                worker_ = std::thread([st] { worker_run(st); });
+            }
         }
     }
 

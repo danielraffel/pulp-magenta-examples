@@ -810,6 +810,7 @@ int check_frozen_loop_state_round_trip() {
     EnvGuard home_guard("HOME", home_string.c_str());
     EnvGuard pulp_home_guard("PULP_HOME", pulp_home_string.c_str());
     EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+    EnvGuard worker_guard("PULP_MAGENTA_V2_TEST_DISABLE_WORKER", "1");
 
     Processor processor;
     pulp::state::StateStore state;
@@ -1229,6 +1230,7 @@ int check_adapter_frozen_loop_state_round_trip() {
     EnvGuard home_guard("HOME", home_string.c_str());
     EnvGuard pulp_home_guard("PULP_HOME", pulp_home_string.c_str());
     EnvGuard explicit_model_guard("MRT2_MODEL", nullptr);
+    EnvGuard worker_guard("PULP_MAGENTA_V2_TEST_DISABLE_WORKER", "1");
 
     const int clap_result =
         check_clap_adapter_frozen_loop_state_round_trip(frozen_blob, kExpectedSample);
