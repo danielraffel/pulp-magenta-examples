@@ -371,7 +371,13 @@ trap cleanup EXIT
 
 mkdir -p "$artifacts_dir"
 
-"$repo_root/scripts/smoke-v2-hot-reload.sh" "$build_dir"
+(
+  unset PULP_STANDALONE_PACKAGE_AUDIT
+  unset PULP_MAGENTA_V2_PACKAGE_AUDIT
+  unset PULP_STANDALONE_PACKAGE_AUDIT_AUDIO
+  unset PULP_MAGENTA_V2_PACKAGE_AUDIT_AUDIO
+  "$repo_root/scripts/smoke-v2-hot-reload.sh" "$build_dir"
+)
 if is_truthy "$include_plugin_installer"; then
   echo "Building plug-in bundles for installer package"
   cmake --build "$build_dir" \
