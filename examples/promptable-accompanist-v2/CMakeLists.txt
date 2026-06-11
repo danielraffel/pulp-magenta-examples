@@ -80,6 +80,12 @@ if(PULP_BUILD_TESTS)
     target_compile_definitions(promptable-accompanist-v2-test PRIVATE
         PROMPTABLE_ACCOMPANIST_V2_TESTING=1
     )
+    if(TARGET PromptableAccompanistV2_CLAP)
+        add_dependencies(promptable-accompanist-v2-test PromptableAccompanistV2_CLAP)
+        target_compile_definitions(promptable-accompanist-v2-test PRIVATE
+            PROMPTABLE_ACCOMPANIST_V2_CLAP_BUNDLE_PATH="${CMAKE_BINARY_DIR}/CLAP/PromptableAccompanistV2.clap"
+        )
+    endif()
     target_include_directories(promptable-accompanist-v2-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME promptable-accompanist-v2-test COMMAND promptable-accompanist-v2-test)
 endif()

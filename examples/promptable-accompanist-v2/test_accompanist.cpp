@@ -9,6 +9,8 @@
 #include <pulp/view/text_editor.hpp>
 #include <pulp/view/widgets.hpp>
 
+#include <dlfcn.h>
+
 #if defined(__APPLE__)
 #include <pulp/format/au_v2_instrument.hpp>
 #include <CoreFoundation/CoreFoundation.h>
@@ -893,34 +895,52 @@ int64_t adapter_mem_read(const clap_istream_t* stream, void* data, uint64_t size
     return static_cast<int64_t>(count);
 }
 
-int check_clap_adapter_frozen_loop_state_round_trip(
-    const std::vector<std::uint8_t>& frozen_blob,
-    float expected) {
+int save_clap_adapter_frozen_loop_state(const std::vector<std::uint8_t>& frozen_blob,
+                                        std::vector<std::uint8_t>& saved_state) {
     configure_adapter_test_factory();
     const auto* factory = &pulp::format::clap_generic::plugin_factory;
     const auto* desc = factory->get_plugin_descriptor(factory, 0);
-    CHECK(desc != nullptr, "CLAP adapter exposes V2 descriptor");
+    CHECK(desc != nullptr, "CLAP adapter exposes V2 descriptor for state save");
 
     const clap_plugin_t* saver = factory->create_plugin(factory, nullptr, desc->id);
-    CHECK(saver != nullptr, "CLAP adapter creates V2 saver instance");
-    CHECK(saver->init(saver), "CLAP adapter initializes V2 saver instance");
+    CHECK(saver != nullptr, "CLAP adapter creates V2 saver instance for state save");
+    CHECK(saver->init(saver), "CLAP adapter initializes V2 saver instance for state save");
     CHECK(saver->activate(saver, 48000.0, 64, 64),
-          "CLAP adapter activates V2 saver instance");
+          "CLAP adapter activates V2 saver instance for state save");
     auto* saver_processor = last_v2_adapter_processor();
-    CHECK(saver_processor != nullptr, "CLAP adapter exposes V2 saver processor");
+    CHECK(saver_processor != nullptr, "CLAP adapter exposes V2 saver processor for state save");
     saver_processor->state().set_value(kFreeze, 1.0f);
     CHECK(saver_processor->deserialize_plugin_state(frozen_blob),
-          "CLAP adapter saver accepts frozen loop payload");
+          "CLAP adapter saver accepts frozen loop payload for state save");
 
     auto* saver_state = static_cast<const clap_plugin_state_t*>(
         saver->get_extension(saver, CLAP_EXT_STATE));
-    CHECK(saver_state != nullptr, "CLAP adapter exposes state extension");
+    CHECK(saver_state != nullptr, "CLAP adapter exposes state extension for state save");
     AdapterMemStream saved_stream;
     clap_ostream_t ostream{};
     ostream.ctx = &saved_stream;
     ostream.write = adapter_mem_write;
     CHECK(saver_state->save(saver, &ostream), "CLAP adapter saves frozen loop state");
     CHECK(!saved_stream.bytes.empty(), "CLAP adapter writes non-empty frozen loop state");
+
+    saver->deactivate(saver);
+    saver->destroy(saver);
+    pulp::format::clap_generic::g_factory = nullptr;
+    saved_state = std::move(saved_stream.bytes);
+    return 0;
+}
+
+int check_clap_adapter_frozen_loop_state_round_trip(
+    const std::vector<std::uint8_t>& frozen_blob,
+    float expected) {
+    std::vector<std::uint8_t> saved_state;
+    const int save_result = save_clap_adapter_frozen_loop_state(frozen_blob, saved_state);
+    if (save_result != 0) return save_result;
+
+    configure_adapter_test_factory();
+    const auto* factory = &pulp::format::clap_generic::plugin_factory;
+    const auto* desc = factory->get_plugin_descriptor(factory, 0);
+    CHECK(desc != nullptr, "CLAP adapter exposes V2 descriptor");
 
     const clap_plugin_t* loader = factory->create_plugin(factory, nullptr, desc->id);
     CHECK(loader != nullptr, "CLAP adapter creates V2 loader instance");
@@ -932,7 +952,7 @@ int check_clap_adapter_frozen_loop_state_round_trip(
     CHECK(loader_state != nullptr, "CLAP adapter loader exposes state extension");
 
     AdapterMemStream input_stream;
-    input_stream.bytes = saved_stream.bytes;
+    input_stream.bytes = saved_state;
     clap_istream_t istream{};
     istream.ctx = &input_stream;
     istream.read = adapter_mem_read;
@@ -947,10 +967,145 @@ int check_clap_adapter_frozen_loop_state_round_trip(
 
     loader->deactivate(loader);
     loader->destroy(loader);
-    saver->deactivate(saver);
-    saver->destroy(saver);
     pulp::format::clap_generic::g_factory = nullptr;
     return 0;
+}
+
+int check_hosted_clap_frozen_loop_state_round_trip(
+    const std::vector<std::uint8_t>& frozen_blob,
+    float expected) {
+#if defined(PROMPTABLE_ACCOMPANIST_V2_CLAP_BUNDLE_PATH)
+    std::vector<std::uint8_t> saved_state;
+    const int save_result = save_clap_adapter_frozen_loop_state(frozen_blob, saved_state);
+    if (save_result != 0) return save_result;
+
+    const std::filesystem::path clap_path = PROMPTABLE_ACCOMPANIST_V2_CLAP_BUNDLE_PATH;
+    CHECK(std::filesystem::exists(clap_path),
+          "hosted CLAP recall test has a built PromptableAccompanistV2 bundle");
+
+    auto binary_path = clap_path;
+    if (std::filesystem::is_directory(clap_path)) {
+        binary_path = clap_path / "Contents" / "MacOS" / clap_path.stem();
+    }
+    void* handle = dlopen(binary_path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+    CHECK(handle != nullptr, "hosted CLAP recall test dlopens the built V2 binary");
+    auto* entry = reinterpret_cast<const clap_plugin_entry_t*>(dlsym(handle, "clap_entry"));
+    CHECK(entry != nullptr, "hosted CLAP recall test resolves clap_entry");
+    CHECK(entry->init != nullptr && entry->get_factory != nullptr && entry->deinit != nullptr,
+          "hosted CLAP recall test has a complete clap_entry");
+    CHECK(entry->init(clap_path.string().c_str()), "hosted CLAP recall test initializes entry");
+
+    const auto* factory = static_cast<const clap_plugin_factory_t*>(
+        entry->get_factory(CLAP_PLUGIN_FACTORY_ID));
+    CHECK(factory != nullptr, "hosted CLAP recall test gets the plugin factory");
+    const clap_plugin_descriptor_t* desc = nullptr;
+    const auto count = factory->get_plugin_count(factory);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto* candidate = factory->get_plugin_descriptor(factory, i);
+        if (candidate && candidate->id &&
+            std::strcmp(candidate->id, "com.pulp.magenta.accompanist.v2") == 0) {
+            desc = candidate;
+            break;
+        }
+    }
+    CHECK(desc != nullptr, "hosted CLAP recall test finds the V2 descriptor");
+
+    clap_host_t host{};
+    host.clap_version = CLAP_VERSION_INIT;
+    host.name = "PromptableAccompanistV2 recall test";
+    host.vendor = "PulpMagenta";
+    host.url = "";
+    host.version = "0.1.0";
+    host.get_extension = [](const clap_host_t*, const char*) -> const void* {
+        return nullptr;
+    };
+    host.request_restart = [](const clap_host_t*) {};
+    host.request_process = [](const clap_host_t*) {};
+    host.request_callback = [](const clap_host_t*) {};
+
+    const clap_plugin_t* plugin = factory->create_plugin(factory, &host, desc->id);
+    CHECK(plugin != nullptr, "hosted CLAP recall test creates the V2 plugin instance");
+    CHECK(plugin->init(plugin), "hosted CLAP recall test initializes the V2 plugin instance");
+
+    const auto* state = static_cast<const clap_plugin_state_t*>(
+        plugin->get_extension(plugin, CLAP_EXT_STATE));
+    CHECK(state != nullptr && state->load != nullptr && state->save != nullptr,
+          "hosted CLAP recall test gets the state extension");
+    AdapterMemStream input_stream;
+    input_stream.bytes = saved_state;
+    clap_istream_t istream{};
+    istream.ctx = &input_stream;
+    istream.read = adapter_mem_read;
+    CHECK(state->load(plugin, &istream),
+          "hosted V2 CLAP binary restores adapter-saved frozen loop state");
+
+    const auto* params = static_cast<const clap_plugin_params_t*>(
+        plugin->get_extension(plugin, CLAP_EXT_PARAMS));
+    CHECK(params != nullptr && params->get_value != nullptr,
+          "hosted CLAP recall test gets the params extension");
+    double freeze_value = 0.0;
+    CHECK(params->get_value(plugin, kFreeze, &freeze_value),
+          "hosted V2 CLAP binary exposes the Freeze parameter");
+    CHECK(freeze_value >= 0.5,
+          "hosted V2 CLAP binary exposes the restored Freeze value");
+
+    CHECK(plugin->activate(plugin, 48000.0, 64, 64),
+          "hosted V2 CLAP binary activates after recall");
+    CHECK(plugin->start_processing(plugin),
+          "hosted V2 CLAP binary starts processing after recall");
+
+    pulp::audio::Buffer<float> output(2, 64);
+    auto left = output.channel(0).data();
+    auto right = output.channel(1).data();
+    float* output_channels[2] = {left, right};
+    clap_audio_buffer_t out_buffer{};
+    out_buffer.data32 = output_channels;
+    out_buffer.channel_count = 2;
+
+    clap_input_events_t input_events{};
+    input_events.size = [](const clap_input_events_t*) -> std::uint32_t {
+        return 0;
+    };
+    input_events.get = [](const clap_input_events_t*, std::uint32_t)
+        -> const clap_event_header_t* {
+        return nullptr;
+    };
+    clap_output_events_t output_events{};
+    output_events.try_push = [](const clap_output_events_t*,
+                                const clap_event_header_t*) -> bool {
+        return true;
+    };
+    clap_process_t process{};
+    process.frames_count = 64;
+    process.audio_outputs = &out_buffer;
+    process.audio_outputs_count = 1;
+    process.in_events = &input_events;
+    process.out_events = &output_events;
+    CHECK(plugin->process(plugin, &process) != CLAP_PROCESS_ERROR,
+          "hosted V2 CLAP binary processes after recall");
+    CHECK(max_abs_error_from(output, expected) < 0.001,
+          "hosted V2 CLAP binary renders the restored frozen loop");
+
+    AdapterMemStream saved_again;
+    clap_ostream_t ostream{};
+    ostream.ctx = &saved_again;
+    ostream.write = adapter_mem_write;
+    CHECK(state->save(plugin, &ostream),
+          "hosted V2 CLAP binary reserializes the restored state");
+    CHECK(!saved_again.bytes.empty(),
+          "hosted V2 CLAP binary writes non-empty recalled state");
+
+    plugin->stop_processing(plugin);
+    plugin->deactivate(plugin);
+    plugin->destroy(plugin);
+    entry->deinit();
+    dlclose(handle);
+    return 0;
+#else
+    (void)frozen_blob;
+    (void)expected;
+    return 0;
+#endif
 }
 
 #if defined(__APPLE__)
@@ -1003,6 +1158,10 @@ int check_adapter_frozen_loop_state_round_trip() {
     const int clap_result =
         check_clap_adapter_frozen_loop_state_round_trip(frozen_blob, kExpectedSample);
     if (clap_result != 0) return clap_result;
+
+    const int hosted_clap_result =
+        check_hosted_clap_frozen_loop_state_round_trip(frozen_blob, kExpectedSample);
+    if (hosted_clap_result != 0) return hosted_clap_result;
 
 #if defined(__APPLE__)
     const int auv2_result =
