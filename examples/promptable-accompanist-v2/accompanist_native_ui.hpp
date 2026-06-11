@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace pulp::examples::accompanist_v2 {
 
@@ -20,6 +21,7 @@ using SetParamNorm = std::function<void(std::uint32_t, float)>;        // normal
 using GetParamNorm = std::function<float(std::uint32_t)>;
 using FmtParam     = std::function<std::string(std::uint32_t)>;       // formatted actual value
 using SetPrompt    = std::function<void(const std::string&)>;         // publishes desired prompt
+using StartFrozenDrag = std::function<bool(view::View&, view::Point)>;
 
 // Magenta tokens (examples/common/react_ui/colors.ts).
 namespace mag {
@@ -40,7 +42,8 @@ class AccompanistNativeRoot final : public view::View {
 
 public:
     AccompanistNativeRoot(SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt,
-                          SetPrompt set_prompt, std::string prompt) {
+                          SetPrompt set_prompt, StartFrozenDrag start_frozen_drag,
+                          std::string prompt) {
         set_theme(view::Theme::dark());
         set_background_color(mag::grey900());
         flex().direction = view::FlexDirection::column;
@@ -72,7 +75,7 @@ public:
         };
         add_child(std::move(prompt_box));
 
-        add_freeze_row(set_p, get_p);
+        add_freeze_row(set_p, get_p, std::move(start_frozen_drag));
 
         static constexpr ParamRow kRows[] = {
             {kTemperature,     "Temperature", 58.0f},
@@ -90,7 +93,67 @@ public:
     }
 
 private:
-    void add_freeze_row(const SetParamNorm& set_p, const GetParamNorm& get_p) {
+    class FreezeDragButton final : public view::ToggleButton {
+    public:
+        explicit FreezeDragButton(StartFrozenDrag start_drag)
+            : start_drag_(std::move(start_drag)) {}
+
+        void on_mouse_down(view::Point pos) override {
+            pressed_ = true;
+            drag_attempted_ = false;
+            drag_started_ = false;
+            press_pos_ = pos;
+        }
+
+        void on_mouse_drag(view::Point pos) override {
+            if (!pressed_ || drag_attempted_) return;
+            const float dx = pos.x - press_pos_.x;
+            const float dy = pos.y - press_pos_.y;
+            if (dx * dx + dy * dy < kDragThresholdPx * kDragThresholdPx) return;
+
+            drag_attempted_ = true;
+            if (start_drag_) {
+                drag_started_ = start_drag_(*this, local_to_root(pos));
+            }
+        }
+
+        void on_mouse_up(view::Point) override {
+            if (!pressed_) return;
+            const bool should_toggle = !drag_attempted_ && !drag_started_;
+            pressed_ = false;
+            drag_attempted_ = false;
+            drag_started_ = false;
+            if (!should_toggle) return;
+
+            set_on(!is_on());
+            if (on_toggle) on_toggle(is_on());
+        }
+
+        void on_mouse_cancel(view::Point) override {
+            pressed_ = false;
+            drag_attempted_ = false;
+            drag_started_ = false;
+        }
+
+    private:
+        view::Point local_to_root(view::Point local) const {
+            for (const view::View* v = this; v; v = v->parent()) {
+                local.x += v->bounds().x;
+                local.y += v->bounds().y;
+            }
+            return local;
+        }
+
+        static constexpr float kDragThresholdPx = 4.0f;
+        StartFrozenDrag start_drag_;
+        view::Point press_pos_{};
+        bool pressed_ = false;
+        bool drag_attempted_ = false;
+        bool drag_started_ = false;
+    };
+
+    void add_freeze_row(const SetParamNorm& set_p, const GetParamNorm& get_p,
+                        StartFrozenDrag start_frozen_drag) {
         auto row = std::make_unique<view::View>();
         row->flex().direction = view::FlexDirection::row;
         row->flex().gap = 12;
@@ -102,7 +165,7 @@ private:
         label->flex().preferred_width = 104;
         row->add_child(std::move(label));
 
-        auto freeze = std::make_unique<view::ToggleButton>();
+        auto freeze = std::make_unique<FreezeDragButton>(std::move(start_frozen_drag));
         freeze->set_label("Freeze");
         freeze->set_font_size(13.0f);
         freeze->set_corner_radius(8.0f);
@@ -158,9 +221,10 @@ private:
 
 inline std::unique_ptr<view::View> make_accompanist_native_view(
     SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt, SetPrompt set_prompt,
-    std::string prompt) {
+    StartFrozenDrag start_frozen_drag, std::string prompt) {
     return std::make_unique<AccompanistNativeRoot>(std::move(set_p), std::move(get_p),
                                                    std::move(fmt), std::move(set_prompt),
+                                                   std::move(start_frozen_drag),
                                                    std::move(prompt));
 }
 

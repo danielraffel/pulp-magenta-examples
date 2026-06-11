@@ -33,13 +33,15 @@ namespace acc = pulp::examples::accompanist_v2;
 class AccompanistRoot : public pulp::view::View {
 public:
     AccompanistRoot(acc::SetParamNorm set_p, acc::GetParamNorm get_p, acc::FmtParam fmt,
-                    acc::SetPrompt set_prompt, std::function<bool()> model_ready,
+                    acc::SetPrompt set_prompt, acc::StartFrozenDrag start_frozen_drag,
+                    std::function<bool()> model_ready,
                     std::function<std::string()> runtime_status,
                     std::function<void()> on_model_changed, std::string prompt)
         : set_p_(std::move(set_p)),
           get_p_(std::move(get_p)),
           fmt_(std::move(fmt)),
           set_prompt_(std::move(set_prompt)),
+          start_frozen_drag_(std::move(start_frozen_drag)),
           model_ready_(std::move(model_ready)),
           runtime_status_(std::move(runtime_status)),
           on_model_changed_(std::move(on_model_changed)),
@@ -274,7 +276,9 @@ private:
                 if (set_prompt_) set_prompt_(p);
             };
             native_ui_held_ = acc::make_accompanist_native_view(set_p_, get_p_, fmt_,
-                                                                std::move(set_prompt_persist), prompt_);
+                                                                std::move(set_prompt_persist),
+                                                                start_frozen_drag_,
+                                                                prompt_);
         }
         native_ui_ptr_ = native_ui_held_.get();
         add_child(std::move(native_ui_held_));
@@ -322,6 +326,7 @@ private:
     acc::GetParamNorm get_p_;
     acc::FmtParam fmt_;
     acc::SetPrompt set_prompt_;
+    acc::StartFrozenDrag start_frozen_drag_;
     std::function<bool()> model_ready_;
     std::function<std::string()> runtime_status_;
     std::function<void()> on_model_changed_;

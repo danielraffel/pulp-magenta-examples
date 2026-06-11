@@ -20,8 +20,10 @@
 
 #include <pulp/format/processor.hpp>
 #include <pulp/audio/buffer.hpp>
+#include <pulp/audio/sample_asset_io.hpp>
 #include <pulp/midi/buffer.hpp>
 #include <pulp/state/store.hpp>
+#include <pulp/view/drag_drop.hpp>
 
 #include <pulp/runtime/model_store.hpp>
 
@@ -647,6 +649,60 @@ public:
         return serialize_frozen_loop_snapshot(*snapshot);
     }
 
+    std::string export_active_frozen_loop_wav_for_drag() const {
+        if (state().get_value(kFreeze) < 0.5f) return {};
+        const auto snapshot = freeze_sampler_.frozen_snapshot();
+        if (!snapshot || snapshot->num_channels == 0 || snapshot->num_frames < 2 ||
+            snapshot->planar_samples.empty() || !(snapshot->sample_rate > 0.0) ||
+            !std::isfinite(snapshot->sample_rate) ||
+            snapshot->sample_rate > static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+            return {};
+        }
+
+        const auto frames = static_cast<std::size_t>(snapshot->num_frames);
+        const auto channels = static_cast<std::size_t>(snapshot->num_channels);
+        if (channels == 0 || frames == 0 ||
+            snapshot->planar_samples.size() != frames * channels) {
+            return {};
+        }
+
+        audio::AudioFileData audio;
+        audio.sample_rate = static_cast<std::uint32_t>(std::llround(snapshot->sample_rate));
+        if (audio.sample_rate == 0) return {};
+
+        try {
+            audio.channels.resize(channels);
+            for (std::size_t ch = 0; ch < channels; ++ch) {
+                const auto* begin = snapshot->planar_samples.data() + frames * ch;
+                audio.channels[ch].assign(begin, begin + frames);
+            }
+
+            std::error_code ec;
+            const auto dir = std::filesystem::temp_directory_path(ec) /
+                             "pulp-magenta-v2-frozen-loops";
+            if (ec) return {};
+            std::filesystem::create_directories(dir, ec);
+            if (ec) return {};
+
+            static std::atomic<std::uint64_t> export_counter{0};
+            const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto index = export_counter.fetch_add(1, std::memory_order_relaxed);
+            const auto path = dir / ("PromptableAccompanistV2-frozen-loop-" +
+                                     std::to_string(stamp) + "-" +
+                                     std::to_string(index) + ".wav");
+
+            audio::SampleAssetPolicy policy;
+            policy.allowed_audio_write_extensions = {".wav"};
+            const auto result = audio::SampleAssetExporter{}.export_audio_file(
+                path.string(), audio, policy);
+            if (!result.ok()) return {};
+            return path.string();
+        } catch (...) {
+            return {};
+        }
+    }
+
     bool deserialize_plugin_state(std::span<const std::uint8_t> data) override {
         if (data.empty()) {
             pending_frozen_snapshot_.reset();
@@ -754,6 +810,9 @@ public:
                 return buf;
             },
             [this](const std::string& p) { if (st_) st_->set_prompt(p); },
+            [this](view::View& source, view::Point root_pos) {
+                return start_frozen_loop_drag(source, root_pos);
+            },
             [this] { return model_ready_for_editor(); },  // model_ready
             [this] { return runtime_status_text(); },
             // on_model_changed (in-editor Models overlay, DAW). Ask the worker to hot-reload
@@ -770,6 +829,16 @@ public:
 
     FreezeLoopSamplerStatus freeze_sampler_status() const noexcept {
         return freeze_sampler_.status();
+    }
+
+    bool start_frozen_loop_drag(view::View& source, view::Point root_pos) const {
+        const auto path = export_active_frozen_loop_wav_for_drag();
+        if (path.empty()) return false;
+        view::FileDragRequest request;
+        request.file_paths = {path};
+        request.root_position = root_pos;
+        request.display_name = "PromptableAccompanistV2 frozen loop";
+        return source.start_file_drag(request);
     }
 
 #ifdef PROMPTABLE_ACCOMPANIST_V2_TESTING

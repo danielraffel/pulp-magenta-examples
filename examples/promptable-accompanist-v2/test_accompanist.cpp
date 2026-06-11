@@ -5,13 +5,14 @@
 #include "freeze_loop_sampler.hpp"
 
 #include <pulp/format/clap_entry.hpp>
+#include <pulp/audio/audio_file.hpp>
 #include <pulp/runtime/scoped_no_alloc.hpp>
 #include <pulp/view/text_editor.hpp>
 #include <pulp/view/widgets.hpp>
 
 #include <dlfcn.h>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(PROMPTABLE_ACCOMPANIST_V2_HAS_AUSDK)
 #include <pulp/format/au_v2_instrument.hpp>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
@@ -612,6 +613,7 @@ int check_status_banner_refreshes_after_late_frame_clock() {
         [](std::uint32_t) { return 0.5f; },
         [](std::uint32_t) { return std::string("0"); },
         [](const std::string&) {},
+        [](pulp::view::View&, pulp::view::Point) { return false; },
         [&model_ready] { return model_ready; },
         [&runtime_status] { return runtime_status; },
         [] {},
@@ -682,6 +684,7 @@ int check_prompt_clear_contract() {
         [](std::uint32_t) { return 0.5f; },
         [](std::uint32_t) { return std::string("0"); },
         [](const std::string&) {},
+        [](pulp::view::View&, pulp::view::Point) { return false; },
         "");
     CHECK(view->child_count() >= 3, "native editor renders a prompt field");
     auto* prompt_box = dynamic_cast<pulp::view::TextEditor*>(view->child_at(2));
@@ -837,9 +840,28 @@ int check_frozen_loop_state_round_trip() {
           "processor renders restored frozen audio after state recall");
     CHECK(!processor.serialize_plugin_state().empty(),
           "processor reserializes restored frozen audio while Freeze is on");
+    const auto exported_path = processor.export_active_frozen_loop_wav_for_drag();
+    CHECK(!exported_path.empty(),
+          "processor exports active frozen audio to a draggable WAV");
+    auto exported_audio = pulp::audio::read_audio_file(exported_path);
+    CHECK(exported_audio.has_value(),
+          "exported frozen-loop WAV reads back");
+    CHECK(exported_audio->num_channels() == snapshot.num_channels,
+          "exported frozen-loop WAV preserves channel count");
+    CHECK(exported_audio->num_frames() == snapshot.num_frames,
+          "exported frozen-loop WAV preserves frame count");
+    CHECK(exported_audio->sample_rate == static_cast<std::uint32_t>(snapshot.sample_rate),
+          "exported frozen-loop WAV preserves sample rate");
+    CHECK(!exported_audio->channels.empty() &&
+          !exported_audio->channels[0].empty() &&
+          std::fabs(exported_audio->channels[0][0] - 0.25f) < 0.01f,
+          "exported frozen-loop WAV preserves sample content");
+    std::filesystem::remove(exported_path);
     state.set_value(kFreeze, 0.0f);
     CHECK(processor.serialize_plugin_state().empty(),
           "processor omits frozen audio payload when Freeze is off");
+    CHECK(processor.export_active_frozen_loop_wav_for_drag().empty(),
+          "processor does not export inactive frozen audio after Freeze is released");
     processor.release();
     std::filesystem::remove_all(home);
     return 0;
@@ -1184,7 +1206,7 @@ int dump_clap_adapter_frozen_loop_state_if_requested(
     return 0;
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(PROMPTABLE_ACCOMPANIST_V2_HAS_AUSDK)
 int check_auv2_adapter_frozen_loop_state_round_trip(
     const std::vector<std::uint8_t>& frozen_blob,
     float expected) {
@@ -1244,7 +1266,7 @@ int check_adapter_frozen_loop_state_round_trip() {
         dump_clap_adapter_frozen_loop_state_if_requested(frozen_blob);
     if (dump_clap_result != 0) return dump_clap_result;
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(PROMPTABLE_ACCOMPANIST_V2_HAS_AUSDK)
     const int auv2_result =
         check_auv2_adapter_frozen_loop_state_round_trip(frozen_blob, kExpectedSample);
     if (auv2_result != 0) return auv2_result;

@@ -80,6 +80,11 @@ if(PULP_BUILD_TESTS)
     target_compile_definitions(promptable-accompanist-v2-test PRIVATE
         PROMPTABLE_ACCOMPANIST_V2_TESTING=1
     )
+    if(PULP_HAS_AUSDK)
+        target_compile_definitions(promptable-accompanist-v2-test PRIVATE
+            PROMPTABLE_ACCOMPANIST_V2_HAS_AUSDK=1
+        )
+    endif()
     if(TARGET PromptableAccompanistV2_CLAP)
         add_dependencies(promptable-accompanist-v2-test PromptableAccompanistV2_CLAP)
         target_compile_definitions(promptable-accompanist-v2-test PRIVATE
