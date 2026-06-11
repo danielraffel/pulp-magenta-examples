@@ -930,6 +930,50 @@ int save_clap_adapter_frozen_loop_state(const std::vector<std::uint8_t>& frozen_
     return 0;
 }
 
+int save_clap_adapter_released_loop_state(const std::vector<std::uint8_t>& frozen_blob,
+                                          std::vector<std::uint8_t>& saved_state) {
+    configure_adapter_test_factory();
+    const auto* factory = &pulp::format::clap_generic::plugin_factory;
+    const auto* desc = factory->get_plugin_descriptor(factory, 0);
+    CHECK(desc != nullptr, "CLAP adapter exposes V2 descriptor for released state save");
+
+    const clap_plugin_t* saver = factory->create_plugin(factory, nullptr, desc->id);
+    CHECK(saver != nullptr, "CLAP adapter creates V2 saver instance for released state save");
+    CHECK(saver->init(saver),
+          "CLAP adapter initializes V2 saver instance for released state save");
+    CHECK(saver->activate(saver, 48000.0, 64, 64),
+          "CLAP adapter activates V2 saver instance for released state save");
+    auto* saver_processor = last_v2_adapter_processor();
+    CHECK(saver_processor != nullptr,
+          "CLAP adapter exposes V2 saver processor for released state save");
+    saver_processor->state().set_value(kFreeze, 1.0f);
+    CHECK(saver_processor->deserialize_plugin_state(frozen_blob),
+          "CLAP adapter saver accepts frozen loop payload before release");
+    saver_processor->state().set_value(kFreeze, 0.0f);
+    CHECK(saver_processor->serialize_plugin_state().empty(),
+          "CLAP adapter saver omits frozen loop payload after release");
+
+    auto* saver_state = static_cast<const clap_plugin_state_t*>(
+        saver->get_extension(saver, CLAP_EXT_STATE));
+    CHECK(saver_state != nullptr, "CLAP adapter exposes state extension for released state save");
+    AdapterMemStream saved_stream;
+    clap_ostream_t ostream{};
+    ostream.ctx = &saved_stream;
+    ostream.write = adapter_mem_write;
+    CHECK(saver_state->save(saver, &ostream), "CLAP adapter saves released loop state");
+    CHECK(!saved_stream.bytes.empty(), "CLAP adapter writes non-empty released loop state");
+    const std::string state_text(reinterpret_cast<const char*>(saved_stream.bytes.data()),
+                                 saved_stream.bytes.size());
+    CHECK(state_text.find("PAV2FRZ1") == std::string::npos,
+          "CLAP adapter released state omits the frozen loop payload magic");
+
+    saver->deactivate(saver);
+    saver->destroy(saver);
+    pulp::format::clap_generic::g_factory = nullptr;
+    saved_state = std::move(saved_stream.bytes);
+    return 0;
+}
+
 int check_clap_adapter_frozen_loop_state_round_trip(
     const std::vector<std::uint8_t>& frozen_blob,
     float expected) {
@@ -1111,17 +1155,31 @@ int check_hosted_clap_frozen_loop_state_round_trip(
 int dump_clap_adapter_frozen_loop_state_if_requested(
     const std::vector<std::uint8_t>& frozen_blob) {
     const char* output_path = std::getenv("PULP_MAGENTA_V2_DUMP_CLAP_STATE");
-    if (!output_path || !*output_path) return 0;
+    if (output_path && *output_path) {
+        std::vector<std::uint8_t> saved_state;
+        const int save_result = save_clap_adapter_frozen_loop_state(frozen_blob, saved_state);
+        if (save_result != 0) return save_result;
 
-    std::vector<std::uint8_t> saved_state;
-    const int save_result = save_clap_adapter_frozen_loop_state(frozen_blob, saved_state);
-    if (save_result != 0) return save_result;
+        std::ofstream output(output_path, std::ios::binary);
+        CHECK(output.is_open(), "dump CLAP frozen loop state opens output file");
+        output.write(reinterpret_cast<const char*>(saved_state.data()),
+                     static_cast<std::streamsize>(saved_state.size()));
+        CHECK(output.good(), "dump CLAP frozen loop state writes output file");
+    }
 
-    std::ofstream output(output_path, std::ios::binary);
-    CHECK(output.is_open(), "dump CLAP frozen loop state opens output file");
-    output.write(reinterpret_cast<const char*>(saved_state.data()),
-                 static_cast<std::streamsize>(saved_state.size()));
-    CHECK(output.good(), "dump CLAP frozen loop state writes output file");
+    output_path = std::getenv("PULP_MAGENTA_V2_DUMP_CLAP_RELEASED_STATE");
+    if (output_path && *output_path) {
+        std::vector<std::uint8_t> saved_state;
+        const int save_result = save_clap_adapter_released_loop_state(frozen_blob, saved_state);
+        if (save_result != 0) return save_result;
+
+        std::ofstream output(output_path, std::ios::binary);
+        CHECK(output.is_open(), "dump CLAP released loop state opens output file");
+        output.write(reinterpret_cast<const char*>(saved_state.data()),
+                     static_cast<std::streamsize>(saved_state.size()));
+        CHECK(output.good(), "dump CLAP released loop state writes output file");
+    }
+
     return 0;
 }
 
