@@ -92,6 +92,17 @@ private:
         return label;
     }
 
+    // Shown when a download fails for a reason other than the user cancelling.
+    // Names the sandbox case explicitly: an audio-unit host (e.g. Logic) can
+    // block the plug-in process's network, so the standalone app / copy is the
+    // way out. `what` is "the model" / "the model resources".
+    static std::string network_failure_message(const char* what) {
+        return std::string("Couldn't download ") + what +
+               " from Google. If this plug-in is running inside a DAW, the host "
+               "may be blocking its network \xE2\x80\x94 download in the standalone "
+               "app, or copy ~/.pulp/magenta from another machine.";
+    }
+
     static bool complete_model_at(const std::filesystem::path& root,
                                   const std::string& model_id) {
         return magenta_model_bundle_complete(root / model_id / (model_id + ".mlxfn"));
@@ -102,7 +113,7 @@ private:
         if (complete_model_at(root, "mrt2_small")) names.push_back("Small");
         if (complete_model_at(root, "mrt2_base")) names.push_back("Large");
 
-        if (names.empty()) return "No complete MRT2 models detected";
+        if (names.empty()) return "No model installed yet";
         if (names.size() == 1) return names.front() + " detected";
         return names[0] + " and " + names[1] + " detected";
     }
@@ -215,6 +226,13 @@ private:
         mgr->set_can_close(false);  // the host Settings panel owns navigation
         if (downloading_.load()) mgr->set_download_progress(active_dl_id_, progress_.load());
         add_child(std::move(mgr));
+        // Download-failure message (empty until a non-cancel failure). The SDK
+        // ModelManagerView only shows progress/Cancel, so a failed download would
+        // otherwise just silently revert to "Download"; this surfaces why.
+        auto err_label = make_label("", 12.0f,
+                                    pulp::canvas::Color::rgba8(235, 120, 120, 255));
+        error_label_ = err_label.get();
+        add_child(std::move(err_label));
         refresh_storage_section();
     }
 
@@ -235,6 +253,10 @@ private:
                 if (active.empty() || active == active_dl_id_ || !active_model_complete(active))
                     pulp::runtime::activate_model(magenta_models(), kMagentaSubsystem, active_dl_id_);
                 if (on_model_changed_) on_model_changed_();
+            } else if (error_label_) {
+                // Non-empty only on a real failure (empty on user cancel), so a
+                // cancelled download clears the message rather than showing one.
+                error_label_->set_text(download_error_);
             }
             last_pct_ = -1;
             refresh_list();
@@ -261,6 +283,8 @@ private:
         done_.store(false);
         success_.store(false);
         cancel_ = pulp::runtime::CancellationToken{};
+        download_error_.clear();
+        if (error_label_) error_label_->set_text("");
         if (manager_) manager_->set_download_progress(id, 0.0f);
 
         const auto entry_copy = *entry;
@@ -277,6 +301,7 @@ private:
                 grand_total ? static_cast<double>(entry_copy.size_bytes) / grand_total : 1.0;
 
             bool ok = true;
+            std::string err;
             if (res_total > 0) {
                 ok = download_resources(
                     [this, res_weight](std::uint64_t done, std::uint64_t total) {
@@ -286,6 +311,8 @@ private:
                         return !cancel_.is_cancelled();
                     },
                     &cancel_);
+                if (!ok && !cancel_.is_cancelled())
+                    err = network_failure_message("the model resources");
             }
             if (ok) {
                 auto res = pulp::runtime::install_model(
@@ -299,7 +326,15 @@ private:
                     },
                     &cancel_);
                 ok = res.ok;
+                if (!ok && !cancel_.is_cancelled())
+                    err = res.error.empty()
+                              ? network_failure_message("the model")
+                              : ("Model download failed: " + res.error);
             }
+            // Published before done_ (release) so the UI-thread reader in tick()
+            // sees the message once it observes done_ (acquire). Empty on a
+            // user cancel, so no error is shown for an intentional Cancel.
+            download_error_ = err;
             success_.store(ok, std::memory_order_release);
             done_.store(true, std::memory_order_release);
         });
@@ -312,6 +347,8 @@ private:
     std::function<void()> on_model_changed_;
     pulp::view::ModelManagerView* manager_ = nullptr;
     pulp::view::View* storage_section_ = nullptr;
+    pulp::view::Label* error_label_ = nullptr;
+    std::string download_error_;  // set by worker before done_ (release); read in tick()
     std::thread worker_;
     pulp::runtime::CancellationToken cancel_;
     std::atomic<bool> downloading_{false};

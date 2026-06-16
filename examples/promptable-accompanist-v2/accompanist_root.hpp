@@ -296,13 +296,13 @@ private:
         wrap->flex().gap = 12.0f;
         wrap->flex().padding = 60.0f;
 
-        auto title = std::make_unique<pulp::view::Label>("You need to download a model to start generating audio.");
+        auto title = std::make_unique<pulp::view::Label>("Download a model to start generating audio.");
         title->set_font_size(17.0f);
         title->set_text_color(pulp::canvas::Color::rgba8(225, 225, 230, 255));
         wrap->add_child(std::move(title));
 
         auto hint = std::make_unique<pulp::view::Label>(
-            "Models are downloaded from Google and stored on this Mac.");
+            "Models download from Google (~2 GB), stored once on this Mac and shared across plugins.");
         hint->set_font_size(13.0f);
         hint->set_text_color(pulp::canvas::Color::rgba8(165, 165, 170, 255));
         wrap->add_child(std::move(hint));

@@ -908,7 +908,7 @@ public:
             switch (static_cast<RuntimeIssue>(st->runtime_issue.load(std::memory_order_acquire))) {
                 case RuntimeIssue::missing_resources:
                     if (loaded) return {};
-                    return "Magenta resources are incomplete. Open Settings > Models to repair the install.";
+                    return "Magenta model files are incomplete \xE2\x80\x94 open Settings \xE2\x80\xBA Models to finish downloading (or install from the standalone app if your DAW blocks plug-in downloads).";
                 case RuntimeIssue::missing_model_bundle:
                     if (loaded)
                         return "You need to download or repair a model in Settings > Models to keep generating audio.";
