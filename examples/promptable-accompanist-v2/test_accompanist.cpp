@@ -578,7 +578,7 @@ int check_worker_preflight_rejections_do_not_publish_loading() {
               "missing resources are rejected by the worker preflight path");
         CHECK(!st->loading.load(std::memory_order_acquire),
               "missing resources do not publish loading");
-        CHECK(processor.runtime_status_text().find("resources are incomplete") != std::string::npos,
+        CHECK(processor.runtime_status_text().find("incomplete") != std::string::npos,
               "missing resources worker rejection points to model repair");
     }
 

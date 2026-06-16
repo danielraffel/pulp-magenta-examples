@@ -256,7 +256,11 @@ private:
             } else if (error_label_) {
                 // Non-empty only on a real failure (empty on user cancel), so a
                 // cancelled download clears the message rather than showing one.
+                // set_text() only invalidates layout, and tick() unsubscribes
+                // from the frame clock right after this, so request a repaint
+                // explicitly to guarantee the message paints.
                 error_label_->set_text(download_error_);
+                request_repaint();
             }
             last_pct_ = -1;
             refresh_list();
