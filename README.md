@@ -92,6 +92,39 @@ redistributed here.
 See the delivery plan (`planning/2026-06-05-magenta-rt2-delivery-plan.md` in the private
 pulp-planning repo) for the phased roadmap.
 
+## Freeze, loop & drag-to-DAW (Promptable Accompanist)
+
+The accompanist is a *live* generator, but you often want to keep a passage. The
+**Freeze** control (bottom row of the GPU-native editor) does two things:
+
+- **Tap Freeze** — captures the last few seconds of generated audio into a
+  **seamless loop** and holds it (the generator stops advancing; the loop plays
+  back). Tap again to unfreeze and resume live generation. Two faders shape the
+  capture:
+  - **Capture** (`kCaptureSeconds`, 0.25–8 s, default 2 s) — how much recent
+    audio is frozen into the loop.
+  - **Loop XFade** (`kLoopCrossfadeMs`, 0–100 ms, default 30 ms) — the equal-power
+    crossfade applied at the loop seam so it repeats without a click.
+- **Drag Freeze** — press and drag the Freeze button (past a small threshold)
+  to start a **native outbound file drag** of the frozen loop as a `.wav`. Drop
+  it straight onto your DAW's timeline, an audio track, or the Finder. This rides
+  the core SDK's `View::start_file_drag` / `FileDragRequest` outbound-drag path
+  (NSDraggingSession on macOS), so it behaves like dragging any audio file.
+
+Freeze, Capture, and Loop XFade are **host-automatable parameters**: editor edits
+record as automation and follow playback (gesture brackets + reverse-sync). Note
+the generator itself is free-running — Freeze does **not** tempo-lock the loop to
+the host grid; host-tempo / bar-aligned looping is tracked as a future
+enhancement ([pulp #4148](https://github.com/danielraffel/pulp/issues/4148)).
+
+> Editor text input (the prompt field) and DAW keyboard etiquette — focus
+> highlight + caret, Space/R handing back to the host transport when you leave
+> the field, Escape/Tab/Return to exit — are handled by the Pulp SDK
+> (`core/view`), so they require an SDK that includes those fixes. This repo
+> builds in **floating-SDK mode** (`sdk_version = "latest"` in `pulp.toml`), so a
+> normal build picks them up automatically; run `pulp upgrade` if your installed
+> SDK predates them.
+
 ## Honest limitations
 
 - MRT2 is **generative with ~200 ms latency** — MIDI *steers* density/region/harmony; it is **not**

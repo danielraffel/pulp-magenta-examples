@@ -240,6 +240,7 @@ verify_release_signing_access() {
     echo "Developer ID Application signing is configured but not usable from this shell." >&2
     echo "Run ./scripts/setup-v2-release-signing.sh and make sure its signing probe passes in this same Terminal session." >&2
     echo "If it already passed in another shell, rerun the release command from that shell; macOS keychain access can be session-scoped." >&2
+    rm -rf "$probe_dir"  # RETURN trap does not fire on exit — clean up explicitly
     exit 1
   fi
 
@@ -251,6 +252,7 @@ verify_release_signing_access() {
     echo "Developer ID Installer signing is configured but not usable from this shell." >&2
     echo "Run ./scripts/setup-v2-release-signing.sh and make sure its installer probe passes in this same Terminal session." >&2
     echo "If it already passed in another shell, rerun the release command from that shell; macOS keychain access can be session-scoped." >&2
+    rm -rf "$probe_dir"  # RETURN trap does not fire on exit — clean up explicitly
     exit 1
   fi
 }
@@ -353,8 +355,8 @@ build_component_installer() {
     echo "CLAP bundle not built; omitting CLAP from installer: $clap_bundle"
   fi
 
-  # Optional diagnostics component (off by default).
-  if is_truthy "$include_diagnostics"; then
+  # Optional diagnostics component (resolved gracefully above — see diag_enabled).
+  if [ "$diag_enabled" = "1" ]; then
     local diagnostics_root="$roots_dir/diagnostics"
     mkdir -p "$diagnostics_root/Applications"
     copy_bundle_clean "$diagnostics_app" "$diagnostics_root/Applications/$diagnostics_app_name.app"
@@ -437,26 +439,32 @@ fi
 
 include_plugin_installer="${PULP_MAGENTA_V2_INCLUDE_PLUGIN_INSTALLER:-1}"
 
-# Optional diagnostics helper app. OFF by default — a normal release should not
-# ship it. Set PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 and point
-# PULP_MAGENTA_V2_DIAGNOSTICS_APP at a prebuilt, signed
-# PromptableAccompanistV2Diagnostics.app to include it as a selectable
-# installer component.
-include_diagnostics="${PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS:-0}"
+# Diagnostics helper — an OPTIONAL dev add-on (its own app, not part of Pulp
+# core or this example). Default `auto`: include it as a selectable installer
+# component IF a prebuilt, signed PromptableAccompanistV2Diagnostics.app is
+# available (point PULP_MAGENTA_V2_DIAGNOSTICS_APP at it); otherwise SKIP
+# gracefully — never error, since most users won't have the add-on installed.
+# Force off with PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=0; force-attempt with =1
+# (still graceful — warns and skips if the app/installer is unavailable).
+include_diagnostics="${PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS:-auto}"
 diagnostics_app="${PULP_MAGENTA_V2_DIAGNOSTICS_APP:-}"
 diagnostics_app_name="PromptableAccompanistV2Diagnostics"
-if is_truthy "$include_diagnostics"; then
+diag_enabled=0
+# diag_want: 0 = off, auto = include-if-available (default), explicit = user asked.
+if [ "$include_diagnostics" = "auto" ]; then
+  diag_want=auto
+elif is_truthy "$include_diagnostics"; then
+  diag_want=explicit
+else
+  diag_want=0
+fi
+if [ "$diag_want" != "0" ]; then
   if ! is_truthy "$include_plugin_installer"; then
-    echo "PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 requires the plug-in installer (PULP_MAGENTA_V2_INCLUDE_PLUGIN_INSTALLER=1)." >&2
-    exit 1
-  fi
-  if [ -z "$diagnostics_app" ] || [ ! -d "$diagnostics_app" ]; then
-    echo "PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 but PULP_MAGENTA_V2_DIAGNOSTICS_APP does not point at a .app bundle: '$diagnostics_app'" >&2
-    exit 1
-  fi
-  if [ ! -x "$diagnostics_app/Contents/MacOS/$diagnostics_app_name" ]; then
-    echo "Diagnostics app is missing its executable: $diagnostics_app/Contents/MacOS/$diagnostics_app_name" >&2
-    exit 1
+    [ "$diag_want" = "explicit" ] && echo "Note: diagnostics requested but the plug-in installer is off — skipping the diagnostics component." >&2
+  elif [ -n "$diagnostics_app" ] && [ -x "$diagnostics_app/Contents/MacOS/$diagnostics_app_name" ]; then
+    diag_enabled=1
+  else
+    [ "$diag_want" = "explicit" ] && echo "Note: diagnostics requested but the helper app was not found at '${diagnostics_app:-<unset PULP_MAGENTA_V2_DIAGNOSTICS_APP>}' — skipping (optional add-on)." >&2
   fi
 fi
 
