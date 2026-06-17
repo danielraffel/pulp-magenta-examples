@@ -619,7 +619,11 @@ int check_status_banner_refreshes_after_late_frame_clock() {
         [] {},
         "warm analog pads");
     auto* root_ptr = root.get();
-    CHECK(root_ptr->child_count() == 2,
+    // The Settings button now rides the editor's title row (header accessory)
+    // instead of a separate top bar, so a usable editor has just the native-view
+    // child — one fewer top-level child than the old top-bar layout. Each count
+    // below is therefore the prior expectation minus one.
+    CHECK(root_ptr->child_count() == 1,
           "transient loading status is not rendered once the editor is usable");
 
     pulp::view::View parent;
@@ -628,17 +632,17 @@ int check_status_banner_refreshes_after_late_frame_clock() {
     pulp::view::FrameClock clock;
     parent.set_frame_clock(&clock);
     root_ptr->layout_children();
-    CHECK(root_ptr->child_count() == 2,
+    CHECK(root_ptr->child_count() == 1,
           "late frame-clock attachment does not need to clear transient loading UI");
 
     runtime_status = "Generated audio is underrunning. Try Small, 48 kHz, and close other GPU-heavy apps.";
     clock.tick(1.0f / 60.0f);
-    CHECK(root_ptr->child_count() == 3,
+    CHECK(root_ptr->child_count() == 2,
           "runtime status banner appears when a later warning is published");
 
     runtime_status.clear();
     clock.tick(1.0f / 60.0f);
-    CHECK(root_ptr->child_count() == 2,
+    CHECK(root_ptr->child_count() == 1,
           "runtime status banner clears when the later warning resolves");
     return 0;
 }
@@ -687,7 +691,9 @@ int check_prompt_clear_contract() {
         [](pulp::view::View&, pulp::view::Point) { return false; },
         "");
     CHECK(view->child_count() >= 3, "native editor renders a prompt field");
-    auto* prompt_box = dynamic_cast<pulp::view::TextEditor*>(view->child_at(2));
+    // Title + subtitle now live inside a single header row (child 0), so the
+    // prompt TextEditor is child 1 rather than child 2.
+    auto* prompt_box = dynamic_cast<pulp::view::TextEditor*>(view->child_at(1));
     CHECK(prompt_box != nullptr, "prompt field is a TextEditor");
     CHECK(prompt_box->text().empty(),
           "empty prompt remains empty instead of restoring the startup default");
