@@ -125,6 +125,19 @@ enhancement ([pulp #4148](https://github.com/danielraffel/pulp/issues/4148)).
 > normal build picks them up automatically; run `pulp upgrade` if your installed
 > SDK predates them.
 
+## Diagnostics helper (optional add-on)
+
+If a tester reports "it didn't load," **[DiagnosticKit](https://github.com/danielraffel/pulp-diagnostickit)**
+is an optional add-on they can double-click to collect the facts from *their*
+machine — codesign / Gatekeeper / quarantine / architecture, plugin status,
+model state, crash logs, and an `auval` run — into a ZIP on the Desktop to send
+back. It's best for **early/beta distribution and one-off data collection**;
+intentionally minimal, but friendlier than asking someone to run Terminal
+commands. Build it, point `PULP_MAGENTA_V2_DIAGNOSTICS_APP` at the app, and the
+installer adds a selectable "Diagnostics Helper" component automatically (it
+**skips gracefully** if you don't build it — see DiagnosticKit's README). Not a
+default part of a public release.
+
 ## Honest limitations
 
 - MRT2 is **generative with ~200 ms latency** — MIDI *steers* density/region/harmony; it is **not**
