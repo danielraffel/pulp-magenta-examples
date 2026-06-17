@@ -2,6 +2,17 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Permanent, keychain-independent notarization credential. The Mac Studio CI
+# host churns the login keychain, so the notarytool keychain profile keeps
+# vanishing mid-build ("No Keychain password item found"). A file-based App
+# Store Connect API key survives that; source it here so PULP_NOTARY_KEY_* are
+# set and preferred over the profile in submit_for_notarization. No-op until set.
+if [ -f "$HOME/.config/pulp-notary/env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.config/pulp-notary/env"
+fi
+
 build_dir="${1:-"$repo_root/build-model-status"}"
 app_name="PromptableAccompanistV2"
 version="${PULP_MAGENTA_V2_DMG_VERSION:-0.1.0}"
@@ -92,17 +103,20 @@ submit_for_notarization() {
   local item_label="$2"
 
   echo "Submitting $item_label for Apple notarization"
-  if [ -n "${PULP_MAGENTA_V2_NOTARY_PROFILE:-}" ]; then
-    xcrun notarytool submit "$item_path" \
-      --keychain-profile "$PULP_MAGENTA_V2_NOTARY_PROFILE" \
-      --wait
-  elif [ -n "${PULP_NOTARY_KEY_PATH:-}" ] &&
-       [ -n "${PULP_NOTARY_KEY_ID:-}" ] &&
-       [ -n "${PULP_NOTARY_ISSUER_ID:-}" ]; then
+  # Prefer the file-based App Store Connect API key (survives the CI-host
+  # keychain churn that keeps eating the notarytool profile) over the keychain
+  # profile. See ~/.config/pulp-notary/env, sourced at the top of this script.
+  if [ -n "${PULP_NOTARY_KEY_PATH:-}" ] &&
+     [ -n "${PULP_NOTARY_KEY_ID:-}" ] &&
+     [ -n "${PULP_NOTARY_ISSUER_ID:-}" ]; then
     xcrun notarytool submit "$item_path" \
       --key "$PULP_NOTARY_KEY_PATH" \
       --key-id "$PULP_NOTARY_KEY_ID" \
       --issuer "$PULP_NOTARY_ISSUER_ID" \
+      --wait
+  elif [ -n "${PULP_MAGENTA_V2_NOTARY_PROFILE:-}" ]; then
+    xcrun notarytool submit "$item_path" \
+      --keychain-profile "$PULP_MAGENTA_V2_NOTARY_PROFILE" \
       --wait
   else
     local notary_apple_id="${PULP_NOTARY_APPLE_ID:-${APPLE_ID:-}}"
