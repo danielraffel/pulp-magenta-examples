@@ -820,7 +820,18 @@ public:
             // must NOT rebuild the editor here (that would destroy the ModelSection mid-callback);
             // the overlay's Done button refreshes the editor safely.
             [this] { request_reload_to_default_model(); },
-            current_prompt_for_view());
+            current_prompt_for_view(),
+            // Host automation gestures: bracket each fader drag so Logic arms a
+            // write pass (Touch) and ends it on release. Pairs with the SDK's
+            // AU adapter which forwards begin/end + value to the host.
+            [this](std::uint32_t id) { state().begin_gesture(id); },
+            [this](std::uint32_t id) { state().end_gesture(id); });
+        // Pulp prioritizes the GPU (Dawn/Skia) editor pipeline; opt this native
+        // UI into the GPU PluginViewHost explicitly. The SDK only auto-requests
+        // GPU for scripted UIs, so a native-view editor would otherwise silently
+        // land on the CoreGraphics/CPU host. If GPU init fails in the host
+        // process the SDK falls back to CPU (and screams in the log).
+        editor->set_requires_gpu_host(true);
         editor_ = editor.get();
         return editor;
     }

@@ -36,7 +36,8 @@ public:
                     acc::SetPrompt set_prompt, acc::StartFrozenDrag start_frozen_drag,
                     std::function<bool()> model_ready,
                     std::function<std::string()> runtime_status,
-                    std::function<void()> on_model_changed, std::string prompt)
+                    std::function<void()> on_model_changed, std::string prompt,
+                    acc::BeginGesture begin_p = {}, acc::EndGesture end_p = {})
         : set_p_(std::move(set_p)),
           get_p_(std::move(get_p)),
           fmt_(std::move(fmt)),
@@ -45,7 +46,9 @@ public:
           model_ready_(std::move(model_ready)),
           runtime_status_(std::move(runtime_status)),
           on_model_changed_(std::move(on_model_changed)),
-          prompt_(std::move(prompt)) {
+          prompt_(std::move(prompt)),
+          begin_p_(std::move(begin_p)),
+          end_p_(std::move(end_p)) {
         flex().direction = pulp::view::FlexDirection::column;
         flex().flex_grow = 1.0f;
         rebuild();
@@ -108,6 +111,10 @@ private:
             status_clock_ = fc;
             frame_sub_ = status_clock_->subscribe([this](float) {
                 poll_status_once();
+                // Pull host automation (playback / preset loads) into the faders
+                // each frame. poll_status_once may rebuild the editor, so read the
+                // current native root after it runs.
+                if (native_root_) native_root_->refresh_param_displays();
                 return true;
             });
             poll_status_once();
@@ -246,6 +253,7 @@ private:
         if (native_ui_ptr_) {
             native_ui_held_ = remove_child(native_ui_ptr_);
             native_ui_ptr_ = nullptr;
+            native_root_ = nullptr;
         }
         while (child_count() > 0) remove_child(child_at(0));
 
@@ -261,10 +269,6 @@ private:
     }
 
     void show_editor() {
-        add_child(make_top_bar(make_text_button("\xE2\x9A\x99 Settings", [this] {
-            const std::string status = runtime_status_now();
-            open_settings(status_targets_models(status) ? "Models" : "");
-        })));
         const std::string status = runtime_status_now();
         last_runtime_status_ = status;
         if (!status.empty() && !transient_editor_status(status))
@@ -275,12 +279,21 @@ private:
                 prompt_ = p;
                 if (set_prompt_) set_prompt_(p);
             };
+            // The Settings button rides the title row (header accessory) instead
+            // of a separate top band, so the title is flush with the top.
+            auto settings = make_text_button("\xE2\x9A\x99 Settings", [this] {
+                const std::string st = runtime_status_now();
+                open_settings(status_targets_models(st) ? "Models" : "");
+            });
             native_ui_held_ = acc::make_accompanist_native_view(set_p_, get_p_, fmt_,
                                                                 std::move(set_prompt_persist),
                                                                 start_frozen_drag_,
-                                                                prompt_);
+                                                                prompt_,
+                                                                std::move(settings),
+                                                                begin_p_, end_p_);
         }
         native_ui_ptr_ = native_ui_held_.get();
+        native_root_ = dynamic_cast<acc::AccompanistNativeRoot*>(native_ui_ptr_);
         add_child(std::move(native_ui_held_));
     }
 
@@ -331,6 +344,8 @@ private:
     std::function<std::string()> runtime_status_;
     std::function<void()> on_model_changed_;
     std::string prompt_;
+    acc::BeginGesture begin_p_;
+    acc::EndGesture end_p_;
     bool show_models_ = false;
     int frame_sub_ = -1;
     pulp::view::FrameClock* status_clock_ = nullptr;
@@ -339,6 +354,7 @@ private:
 
     std::unique_ptr<pulp::view::View> native_ui_held_;  // stashed when not mounted
     pulp::view::View* native_ui_ptr_ = nullptr;
+    acc::AccompanistNativeRoot* native_root_ = nullptr;  // typed view for reverse-sync
 };
 
 }  // namespace magenta_demo

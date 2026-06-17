@@ -9,11 +9,13 @@
 
 #include "accompanist_params.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace pulp::examples::accompanist_v2 {
 
@@ -22,6 +24,8 @@ using GetParamNorm = std::function<float(std::uint32_t)>;
 using FmtParam     = std::function<std::string(std::uint32_t)>;       // formatted actual value
 using SetPrompt    = std::function<void(const std::string&)>;         // publishes desired prompt
 using StartFrozenDrag = std::function<bool(view::View&, view::Point)>;
+using BeginGesture = std::function<void(std::uint32_t)>;  // host write-pass arm (Touch)
+using EndGesture   = std::function<void(std::uint32_t)>;  // host write-pass disarm (Release)
 
 // Magenta tokens (examples/common/react_ui/colors.ts).
 namespace mag {
@@ -43,26 +47,47 @@ class AccompanistNativeRoot final : public view::View {
 public:
     AccompanistNativeRoot(SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt,
                           SetPrompt set_prompt, StartFrozenDrag start_frozen_drag,
-                          std::string prompt) {
+                          std::string prompt,
+                          std::unique_ptr<view::View> header_accessory = nullptr,
+                          BeginGesture begin_p = {}, EndGesture end_p = {})
+        : get_p_(get_p), fmt_(fmt),
+          begin_p_(std::move(begin_p)), end_p_(std::move(end_p)) {
         set_theme(view::Theme::dark());
         set_background_color(mag::grey900());
         flex().direction = view::FlexDirection::column;
         flex().padding = 24;
         flex().gap = 10;
 
+        // Header row: title + subtitle on the left, an optional accessory (the
+        // host Settings/Done button) on the right — top-aligned with the title
+        // so it shares the first text row instead of living in its own band.
+        auto header = std::make_unique<view::View>();
+        header->flex().direction = view::FlexDirection::row;
+        header->flex().align_items = view::FlexAlign::start;
+        header->flex().gap = 12;
+
+        auto title_block = std::make_unique<view::View>();
+        title_block->flex().direction = view::FlexDirection::column;
+        title_block->flex().flex_grow = 1.0f;
+        title_block->flex().gap = 2;
+
         auto title = std::make_unique<view::Label>("Promptable Accompanist V2");
         title->set_font_size(20);
         title->set_font_weight(700);
         title->set_text_color(mag::text());
         title->flex().preferred_height = 26;
-        add_child(std::move(title));
+        title_block->add_child(std::move(title));
 
         auto sub = std::make_unique<view::Label>(
             "Magenta RealTime 2  ·  freeze and loop sampler");
         sub->set_font_size(12);
         sub->set_text_color(mag::subtext());
         sub->flex().preferred_height = 16;
-        add_child(std::move(sub));
+        title_block->add_child(std::move(sub));
+
+        header->add_child(std::move(title_block));
+        if (header_accessory) header->add_child(std::move(header_accessory));
+        add_child(std::move(header));
 
         auto prompt_box = std::make_unique<view::TextEditor>();
         prompt_box->set_text(prompt);
@@ -175,10 +200,17 @@ private:
         freeze->set_off_text_color(mag::text());
         freeze->flex().flex_grow = 1;
         freeze->flex().preferred_height = 34;
+        auto* freeze_ptr = freeze.get();
         if (get_p) freeze->set_on(get_p(kFreeze) >= 0.5f);
-        freeze->on_toggle = [set_p](bool on) {
+        freeze->on_toggle = [this, set_p](bool on) {
+            // A flip is a complete one-shot gesture so the DAW records the
+            // discrete on/off change (mirrors bind_parameter(ToggleButton)).
+            if (begin_p_) begin_p_(kFreeze);
             if (set_p) set_p(kFreeze, on ? 1.0f : 0.0f);
+            if (end_p_) end_p_(kFreeze);
         };
+        freeze_btn_ = freeze_ptr;
+        freeze_last_on_ = get_p ? (get_p(kFreeze) >= 0.5f) : false;
         row->add_child(std::move(freeze));
         add_child(std::move(row));
     }
@@ -215,17 +247,75 @@ private:
             if (set_p) set_p(id, v);
             if (fmt && val_ptr) val_ptr->set_text(fmt(id));
         };
+        // Bracket the drag in a host gesture so the DAW records (and on release
+        // ends) a write pass — the equivalent of bind_parameter's
+        // on_gesture_begin/end. Without this, moving the fader changes the value
+        // audibly but Logic's Touch mode never arms.
+        const std::uint32_t gid = row_info.id;
+        fader_ptr->on_gesture_begin = [this, gid] { if (begin_p_) begin_p_(gid); };
+        fader_ptr->on_gesture_end   = [this, gid] { if (end_p_) end_p_(gid); };
+
+        const float initial = get_p ? get_p(row_info.id) : 0.0f;
+        faders_.push_back(BoundFader{row_info.id, fader_ptr, val_ptr, initial});
         add_child(std::move(row));
     }
+
+public:
+    // Reverse-sync: pull current parameter values into the faders so host
+    // automation playback (and preset loads) move the on-screen controls.
+    // Driven from AccompanistRoot's FrameClock tick. Idempotent and cheap —
+    // a per-fader last-value guard skips untouched controls entirely, and
+    // Fader::set_value early-returns on no change, so a static UI does no work.
+    void refresh_param_displays() {
+        if (!get_p_) return;
+        for (auto& f : faders_) {
+            const float v = get_p_(f.id);
+            if (std::abs(v - f.last_norm) < 1e-4f) continue;
+            f.last_norm = v;
+            f.fader->set_value(v);
+            if (fmt_ && f.value_label) f.value_label->set_text(fmt_(f.id));
+        }
+        if (freeze_btn_) {
+            const bool on = get_p_(kFreeze) >= 0.5f;
+            if (on != freeze_last_on_) {
+                freeze_last_on_ = on;
+                freeze_btn_->set_on(on);  // set_on does not re-fire on_toggle
+            }
+        }
+    }
+
+private:
+    // Reverse-sync state: how to read parameter values + format them, and the
+    // host gesture callbacks the faders bracket their drags with.
+    GetParamNorm get_p_;
+    FmtParam fmt_;
+    BeginGesture begin_p_;
+    EndGesture end_p_;
+
+    struct BoundFader {
+        std::uint32_t id;
+        view::Fader* fader;
+        view::Label* value_label;
+        float last_norm;  // last value pushed to the fader; skips no-op refreshes
+    };
+    std::vector<BoundFader> faders_;
+
+    // Freeze toggle reverse-sync (kFreeze): follows host automation playback.
+    view::ToggleButton* freeze_btn_ = nullptr;
+    bool freeze_last_on_ = false;
 };
 
 inline std::unique_ptr<view::View> make_accompanist_native_view(
     SetParamNorm set_p, GetParamNorm get_p, FmtParam fmt, SetPrompt set_prompt,
-    StartFrozenDrag start_frozen_drag, std::string prompt) {
+    StartFrozenDrag start_frozen_drag, std::string prompt,
+    std::unique_ptr<view::View> header_accessory = nullptr,
+    BeginGesture begin_p = {}, EndGesture end_p = {}) {
     return std::make_unique<AccompanistNativeRoot>(std::move(set_p), std::move(get_p),
                                                    std::move(fmt), std::move(set_prompt),
                                                    std::move(start_frozen_drag),
-                                                   std::move(prompt));
+                                                   std::move(prompt),
+                                                   std::move(header_accessory),
+                                                   std::move(begin_p), std::move(end_p));
 }
 
 }  // namespace pulp::examples::accompanist_v2
