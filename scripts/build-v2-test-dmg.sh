@@ -172,6 +172,46 @@ sign_bundle_copy() {
   fi
 }
 
+# The diagnostic helper app is a plain SwiftUI utility — no plug-in binary,
+# no bundled mlx.metallib — so sign_bundle_copy's require_bundle_resource
+# guard does not apply. Re-sign it here with hardened runtime + a minimal
+# entitlements plist (network client, for the optional GitHub-upload mode) so
+# the copy in the installer is independently valid and notarizable regardless
+# of how the prebuilt app was signed.
+sign_diagnostics_copy() {
+  local bundle="$1"
+  normalize_bundle_permissions "$bundle"
+  if [ ! -x "$bundle/Contents/MacOS/$diagnostics_app_name" ]; then
+    echo "Missing diagnostics app executable: $bundle/Contents/MacOS/$diagnostics_app_name" >&2
+    exit 1
+  fi
+  local ent
+  ent="$(mktemp /tmp/pulp-v2-diag-ent.XXXXXX.plist)"
+  cat >"$ent" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.network.client</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+  if [ -n "$codesign_identity" ]; then
+    echo "Signing diagnostics app with: $codesign_identity"
+    echo "  $bundle"
+    sign_with_codesign --force --options runtime --timestamp \
+      --entitlements "$ent" --sign "$codesign_identity" "$bundle"
+  else
+    echo "Ad-hoc signing diagnostics app for unsigned package validation"
+    echo "  $bundle"
+    codesign --force --timestamp=none --entitlements "$ent" --sign - "$bundle"
+  fi
+  rm -f "$ent"
+  normalize_bundle_permissions "$bundle"
+  codesign --verify --deep --strict "$bundle"
+}
+
 verify_release_signing_access() {
   local probe_dir
   probe_dir="$(mktemp -d /tmp/pulp-v2-release-signing-probe.XXXXXX)"
@@ -214,26 +254,6 @@ build_component_installer() {
   local distribution_xml="$pkg_work_dir/distribution.xml"
   mkdir -p "$roots_dir" "$packages_dir"
 
-  local standalone_root="$roots_dir/standalone"
-  mkdir -p "$standalone_root/Applications"
-  copy_bundle_clean "$standalone_app" "$standalone_root/Applications/$app_name.app"
-  sign_bundle_copy "$standalone_root/Applications/$app_name.app"
-
-  local vst3_root="$roots_dir/vst3"
-  mkdir -p "$vst3_root/Library/Audio/Plug-Ins/VST3"
-  copy_bundle_clean "$vst3_bundle" "$vst3_root/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
-  sign_bundle_copy "$vst3_root/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
-
-  local au_root="$roots_dir/au"
-  mkdir -p "$au_root/Library/Audio/Plug-Ins/Components"
-  copy_bundle_clean "$au_bundle" "$au_root/Library/Audio/Plug-Ins/Components/$app_name.component"
-  sign_bundle_copy "$au_root/Library/Audio/Plug-Ins/Components/$app_name.component"
-
-  local clap_root="$roots_dir/clap"
-  mkdir -p "$clap_root/Library/Audio/Plug-Ins/CLAP"
-  copy_bundle_clean "$clap_bundle" "$clap_root/Library/Audio/Plug-Ins/CLAP/$app_name.clap"
-  sign_bundle_copy "$clap_root/Library/Audio/Plug-Ins/CLAP/$app_name.clap"
-
   build_component_pkg() {
     local root="$1"
     local identifier="$2"
@@ -248,18 +268,91 @@ build_component_installer() {
     fi
   }
 
+  # Accumulate distribution.xml fragments only for the components that exist.
+  # VST3/AU/CLAP are each conditional on the configured SDK actually exporting
+  # that format (e.g. a checkout without the VST3 SDK builds AU+CLAP only).
+  local dist_outline=""
+  local dist_choices=""
+  local dist_pkgrefs=""
+
+  local nl=$'\n'
+  add_component() {
+    local choice_id="$1" identifier="$2" pkg_file="$3" title="$4" desc="$5" selected="$6"
+    # Use a real-newline variable inside double quotes so every newline is a
+    # newline (ANSI-C $'\n' only interprets escapes in the $'...' segment, not
+    # in plain-quoted continuation segments).
+    dist_outline+="${nl}    <line choice=\"${choice_id}\"/>"
+    dist_choices+="${nl}  <choice id=\"${choice_id}\" title=\"${title}\" description=\"${desc}\" enabled=\"true\" visible=\"true\" start_selected=\"${selected}\">${nl}    <pkg-ref id=\"${identifier}\"/>${nl}  </choice>"
+    dist_pkgrefs+="${nl}  <pkg-ref id=\"${identifier}\">${pkg_file}</pkg-ref>"
+  }
+
+  # Standalone app — always present.
+  local standalone_root="$roots_dir/standalone"
+  mkdir -p "$standalone_root/Applications"
+  copy_bundle_clean "$standalone_app" "$standalone_root/Applications/$app_name.app"
+  sign_bundle_copy "$standalone_root/Applications/$app_name.app"
   build_component_pkg "$standalone_root" \
     "com.pulp.magenta.accompanist.v2.standalone" \
     "$packages_dir/standalone.pkg"
-  build_component_pkg "$vst3_root" \
-    "com.pulp.magenta.accompanist.v2.vst3" \
-    "$packages_dir/vst3.pkg"
-  build_component_pkg "$au_root" \
-    "com.pulp.magenta.accompanist.v2.auv2" \
-    "$packages_dir/auv2.pkg"
-  build_component_pkg "$clap_root" \
-    "com.pulp.magenta.accompanist.v2.clap" \
-    "$packages_dir/clap.pkg"
+  add_component standalone "com.pulp.magenta.accompanist.v2.standalone" standalone.pkg \
+    "Standalone App" "Install $app_name into /Applications." "true"
+
+  if [ -d "$vst3_bundle" ]; then
+    local vst3_root="$roots_dir/vst3"
+    mkdir -p "$vst3_root/Library/Audio/Plug-Ins/VST3"
+    copy_bundle_clean "$vst3_bundle" "$vst3_root/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
+    sign_bundle_copy "$vst3_root/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
+    build_component_pkg "$vst3_root" \
+      "com.pulp.magenta.accompanist.v2.vst3" \
+      "$packages_dir/vst3.pkg"
+    add_component vst3 "com.pulp.magenta.accompanist.v2.vst3" vst3.pkg \
+      "VST3 Plug-In" "Install the VST3 into /Library/Audio/Plug-Ins/VST3." "true"
+  else
+    echo "VST3 bundle not built; omitting VST3 from installer: $vst3_bundle"
+  fi
+
+  if [ -d "$au_bundle" ]; then
+    local au_root="$roots_dir/au"
+    mkdir -p "$au_root/Library/Audio/Plug-Ins/Components"
+    copy_bundle_clean "$au_bundle" "$au_root/Library/Audio/Plug-Ins/Components/$app_name.component"
+    sign_bundle_copy "$au_root/Library/Audio/Plug-Ins/Components/$app_name.component"
+    build_component_pkg "$au_root" \
+      "com.pulp.magenta.accompanist.v2.auv2" \
+      "$packages_dir/auv2.pkg"
+    add_component auv2 "com.pulp.magenta.accompanist.v2.auv2" auv2.pkg \
+      "AUv2 Plug-In" "Install the AUv2 into /Library/Audio/Plug-Ins/Components." "true"
+  else
+    echo "AU bundle not built; omitting AUv2 from installer: $au_bundle"
+  fi
+
+  if [ -d "$clap_bundle" ]; then
+    local clap_root="$roots_dir/clap"
+    mkdir -p "$clap_root/Library/Audio/Plug-Ins/CLAP"
+    copy_bundle_clean "$clap_bundle" "$clap_root/Library/Audio/Plug-Ins/CLAP/$app_name.clap"
+    sign_bundle_copy "$clap_root/Library/Audio/Plug-Ins/CLAP/$app_name.clap"
+    build_component_pkg "$clap_root" \
+      "com.pulp.magenta.accompanist.v2.clap" \
+      "$packages_dir/clap.pkg"
+    add_component clap "com.pulp.magenta.accompanist.v2.clap" clap.pkg \
+      "CLAP Plug-In" "Install the CLAP into /Library/Audio/Plug-Ins/CLAP." "true"
+  else
+    echo "CLAP bundle not built; omitting CLAP from installer: $clap_bundle"
+  fi
+
+  # Optional diagnostics component (off by default).
+  if is_truthy "$include_diagnostics"; then
+    local diagnostics_root="$roots_dir/diagnostics"
+    mkdir -p "$diagnostics_root/Applications"
+    copy_bundle_clean "$diagnostics_app" "$diagnostics_root/Applications/$diagnostics_app_name.app"
+    sign_diagnostics_copy "$diagnostics_root/Applications/$diagnostics_app_name.app"
+    build_component_pkg "$diagnostics_root" \
+      "com.pulp.magenta.accompanist.v2.diagnostics" \
+      "$packages_dir/diagnostics.pkg"
+    add_component diagnostics "com.pulp.magenta.accompanist.v2.diagnostics" diagnostics.pkg \
+      "Diagnostics Helper" \
+      "Optional. Installs $diagnostics_app_name.app into /Applications. Run it if a plug-in fails to load — it collects logs, codesign/notarization/architecture status, and an auval report into a ZIP on your Desktop to send back." \
+      "true"
+  fi
 
   cat >"$distribution_xml" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -267,28 +360,8 @@ build_component_installer() {
   <title>$app_name</title>
   <options customize="allow" require-scripts="false"/>
   <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
-  <choices-outline>
-    <line choice="standalone"/>
-    <line choice="vst3"/>
-    <line choice="auv2"/>
-    <line choice="clap"/>
-  </choices-outline>
-  <choice id="standalone" title="Standalone App" description="Install $app_name into /Applications." enabled="true" visible="true">
-    <pkg-ref id="com.pulp.magenta.accompanist.v2.standalone"/>
-  </choice>
-  <choice id="vst3" title="VST3 Plug-In" description="Install the VST3 into /Library/Audio/Plug-Ins/VST3." enabled="true" visible="true">
-    <pkg-ref id="com.pulp.magenta.accompanist.v2.vst3"/>
-  </choice>
-  <choice id="auv2" title="AUv2 Plug-In" description="Install the AUv2 into /Library/Audio/Plug-Ins/Components." enabled="true" visible="true">
-    <pkg-ref id="com.pulp.magenta.accompanist.v2.auv2"/>
-  </choice>
-  <choice id="clap" title="CLAP Plug-In" description="Install the CLAP into /Library/Audio/Plug-Ins/CLAP." enabled="true" visible="true">
-    <pkg-ref id="com.pulp.magenta.accompanist.v2.clap"/>
-  </choice>
-  <pkg-ref id="com.pulp.magenta.accompanist.v2.standalone">standalone.pkg</pkg-ref>
-  <pkg-ref id="com.pulp.magenta.accompanist.v2.vst3">vst3.pkg</pkg-ref>
-  <pkg-ref id="com.pulp.magenta.accompanist.v2.auv2">auv2.pkg</pkg-ref>
-  <pkg-ref id="com.pulp.magenta.accompanist.v2.clap">clap.pkg</pkg-ref>
+  <choices-outline>$dist_outline
+  </choices-outline>$dist_choices$dist_pkgrefs
 </installer-gui-script>
 EOF
 
@@ -350,6 +423,29 @@ fi
 
 include_plugin_installer="${PULP_MAGENTA_V2_INCLUDE_PLUGIN_INSTALLER:-1}"
 
+# Optional diagnostics helper app. OFF by default — a normal release should not
+# ship it. Set PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 and point
+# PULP_MAGENTA_V2_DIAGNOSTICS_APP at a prebuilt, signed
+# PromptableAccompanistV2Diagnostics.app to include it as a selectable
+# installer component.
+include_diagnostics="${PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS:-0}"
+diagnostics_app="${PULP_MAGENTA_V2_DIAGNOSTICS_APP:-}"
+diagnostics_app_name="PromptableAccompanistV2Diagnostics"
+if is_truthy "$include_diagnostics"; then
+  if ! is_truthy "$include_plugin_installer"; then
+    echo "PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 requires the plug-in installer (PULP_MAGENTA_V2_INCLUDE_PLUGIN_INSTALLER=1)." >&2
+    exit 1
+  fi
+  if [ -z "$diagnostics_app" ] || [ ! -d "$diagnostics_app" ]; then
+    echo "PULP_MAGENTA_V2_INCLUDE_DIAGNOSTICS=1 but PULP_MAGENTA_V2_DIAGNOSTICS_APP does not point at a .app bundle: '$diagnostics_app'" >&2
+    exit 1
+  fi
+  if [ ! -x "$diagnostics_app/Contents/MacOS/$diagnostics_app_name" ]; then
+    echo "Diagnostics app is missing its executable: $diagnostics_app/Contents/MacOS/$diagnostics_app_name" >&2
+    exit 1
+  fi
+fi
+
 cleanup() {
   set +e
   if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
@@ -380,9 +476,22 @@ mkdir -p "$artifacts_dir"
 )
 if is_truthy "$include_plugin_installer"; then
   echo "Building plug-in bundles for installer package"
-  cmake --build "$build_dir" \
-    --target PromptableAccompanistV2_CLAP PromptableAccompanistV2_VST3 PromptableAccompanistV2_AU \
-    -j"$(sysctl -n hw.ncpu)"
+  # Only build the plug-in targets the configured SDK actually defined. A
+  # checkout without the VST3 SDK has no PromptableAccompanistV2_VST3 target,
+  # and naming a missing target makes cmake --build fail outright.
+  plugin_targets=()
+  for tgt in PromptableAccompanistV2_CLAP PromptableAccompanistV2_VST3 PromptableAccompanistV2_AU; do
+    # Dry-run the target build; a missing target makes this fail fast and cheap.
+    if cmake --build "$build_dir" --target "$tgt" -- -n >/dev/null 2>&1; then
+      plugin_targets+=("$tgt")
+    else
+      echo "Skipping unavailable plug-in target: $tgt"
+    fi
+  done
+  if [ "${#plugin_targets[@]}" -gt 0 ]; then
+    cmake --build "$build_dir" --target "${plugin_targets[@]}" \
+      -j"$(sysctl -n hw.ncpu)"
+  fi
 fi
 
 app_path="$build_dir/examples/promptable-accompanist-v2/${app_name}.app"
@@ -411,17 +520,26 @@ else
 fi
 
 if is_truthy "$include_plugin_installer"; then
+  # Include whatever formats the configured SDK actually exported. A checkout
+  # without the VST3 SDK builds AU+CLAP only; require at least one plug-in
+  # format and validate the ones that are present.
+  found_plugin_formats=0
   for bundle in \
     "$build_dir/VST3/$app_name.vst3" \
     "$build_dir/AU/$app_name.component" \
     "$build_dir/CLAP/$app_name.clap"; do
-    if [ ! -d "$bundle" ]; then
-      echo "Missing plug-in bundle for installer: $bundle" >&2
-      echo "Reconfigure with a Pulp SDK that exports VST3, AUv2, and CLAP support." >&2
-      exit 1
+    if [ -d "$bundle" ]; then
+      require_bundle_resource "$bundle" "$app_name"
+      found_plugin_formats=$((found_plugin_formats + 1))
+    else
+      echo "Plug-in bundle not built (will be omitted from installer): $bundle"
     fi
-    require_bundle_resource "$bundle" "$app_name"
   done
+  if [ "$found_plugin_formats" -eq 0 ]; then
+    echo "No plug-in bundles (VST3/AU/CLAP) were built for the installer." >&2
+    echo "Reconfigure with a Pulp SDK that exports at least one plug-in format, or set PULP_MAGENTA_V2_INCLUDE_PLUGIN_INSTALLER=0." >&2
+    exit 1
+  fi
   echo "Building component installer package"
   build_component_installer "$pkg_path" "$stage_app"
 
@@ -500,7 +618,11 @@ for _ in $(seq 1 "$((audit_seconds + 5))"); do
 done
 
 app_status=0
+audit_timed_out=0
 if kill -0 "$app_pid" 2>/dev/null; then
+  # Still running at the time cap: a healthy long-lived render. We terminate
+  # it ourselves, so its non-zero (SIGTERM) status is expected, not a failure.
+  audit_timed_out=1
   kill "$app_pid" 2>/dev/null
   wait "$app_pid" 2>/dev/null || app_status=$?
 else
@@ -508,7 +630,10 @@ else
 fi
 app_pid=""
 
-if [ "$app_status" -ne 0 ] && ! grep -Eq "$audit_failure_re" "$audit_log"; then
+if [ "$app_status" -ne 0 ] && [ "$audit_timed_out" -ne 1 ] && ! grep -Eq "$audit_failure_re" "$audit_log"; then
+  # A non-zero status only signals trouble when the app exited on its OWN. When
+  # we terminated a still-running healthy app at the time cap (audit_timed_out),
+  # the health-marker check below is the real pass/fail gate.
   echo "Packaged-app isolation audit exited with status $app_status. See: $audit_log" >&2
   exit 1
 fi
