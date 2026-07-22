@@ -1,6 +1,6 @@
 # pulp-magenta-examples
 
-Cross-platform [Pulp](https://github.com/danielraffel/pulp) example plugins built on
+Cross-platform [Pulp](https://github.com/Generous-Corp/pulp) example plugins built on
 **Google Magenta RealTime 2 (MRT2)** — the on-device real-time music model. These demos turn
 Magenta's single AUv3 into **VST3 + AU + CLAP + standalone** from one `Processor`, install the
 weights with one command, and (flagship) let an AI agent conduct a live MRT2 instance over MCP.

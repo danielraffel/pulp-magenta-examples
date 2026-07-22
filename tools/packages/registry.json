@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/danielraffel/pulp/main/tools/packages/registry-schema.json",
+  "$schema": "https://raw.githubusercontent.com/Generous-Corp/pulp/main/tools/packages/registry-schema.json",
   "version": 2,
   "packages": {
     "magenta-realtime-2": {
