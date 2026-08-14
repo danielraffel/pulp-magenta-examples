@@ -1,0 +1,759 @@
+#pragma once
+
+#include <pulp/audio/buffer.hpp>
+#include <pulp/audio/loop_renderer.hpp>
+#include <pulp/audio/loop_types.hpp>
+#include <pulp/audio/published_sample_store.hpp>
+#include <pulp/audio/rolling_audio_capture_buffer.hpp>
+#include <pulp/midi/buffer.hpp>
+#include <pulp/runtime/spsc_queue.hpp>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
+
+namespace pulp::examples::accompanist_v2 {
+
+struct FreezeLoopSamplerConfig {
+    std::uint32_t num_channels = 2;
+    double sample_rate = 48000.0;
+    std::uint32_t max_block_frames = 512;
+    double max_capture_seconds = 16.0;
+    std::uint32_t sample_slots = 2;
+};
+
+struct FreezeLoopSamplerControls {
+    bool freeze = false;
+    double capture_seconds = 2.0;
+    double loop_crossfade_ms = 30.0;
+    const midi::MidiBuffer* midi = nullptr;
+    int root_note = 60;
+};
+
+struct FreezeLoopSamplerStatus {
+    bool prepared = false;
+    bool freeze_requested = false;
+    bool materialize_pending = false;
+    bool frozen = false;
+    bool hold_active = false;
+    std::uint64_t sample_frames = 0;
+    std::uint64_t captures_completed = 0;
+    std::uint64_t materialize_failures = 0;
+    std::uint64_t frames_discarded_while_held = 0;
+    std::uint64_t buffer_shape_mismatches = 0;
+};
+
+struct FreezeLoopSamplerSnapshot {
+    std::uint32_t num_channels = 0;
+    std::uint64_t num_frames = 0;
+    double sample_rate = 0.0;
+    double loop_crossfade_ms = 30.0;
+    std::vector<float> planar_samples;
+};
+
+// Host lifecycle calls must be serialized against process(); process() owns the
+// real-time state once prepare() succeeds.
+class FreezeLoopSampler {
+public:
+    FreezeLoopSampler() = default;
+    FreezeLoopSampler(const FreezeLoopSampler&) = delete;
+    FreezeLoopSampler& operator=(const FreezeLoopSampler&) = delete;
+
+    ~FreezeLoopSampler() { shutdown(); }
+
+    bool prepare(const FreezeLoopSamplerConfig& config) {
+        const auto preserved_snapshot = frozen_.load(std::memory_order_acquire)
+            ? frozen_snapshot()
+            : std::optional<FreezeLoopSamplerSnapshot>{};
+        shutdown();
+        if (config.num_channels == 0 || config.num_channels > kMaxChannels ||
+            config.sample_rate <= 0.0 || !std::isfinite(config.sample_rate) ||
+            config.max_block_frames == 0 || config.max_capture_seconds <= 0.0 ||
+            !std::isfinite(config.max_capture_seconds)) {
+            return false;
+        }
+
+        config_ = config;
+        const auto max_frames = static_cast<std::uint64_t>(
+            std::ceil(config.sample_rate * config.max_capture_seconds));
+        if (max_frames == 0) return false;
+
+        const auto capture_result = capture_.prepare_seconds(config.num_channels,
+                                                             config.sample_rate,
+                                                             config.max_capture_seconds);
+        if (!capture_result.ok) return false;
+        if (!store_.prepare({std::max<std::uint32_t>(config.sample_slots, 2u),
+                             config.num_channels,
+                             max_frames})) {
+            capture_.reset();
+            return false;
+        }
+
+        materialize_buffer_.resize(config.num_channels, static_cast<std::size_t>(max_frames));
+        render_scratch_.resize(config.num_channels, config.max_block_frames);
+        keyed_mix_.resize(config.num_channels, config.max_block_frames);
+        publish_ptrs_.assign(config.num_channels, nullptr);
+        running_.store(true, std::memory_order_release);
+        worker_ = std::thread([this] { worker_loop(); });
+        prepared_.store(true, std::memory_order_release);
+        if (preserved_snapshot) restore_frozen_snapshot(*preserved_snapshot);
+        return true;
+    }
+
+    void shutdown() noexcept {
+        prepared_.store(false, std::memory_order_release);
+        running_.store(false, std::memory_order_release);
+        if (worker_.joinable()) worker_.join();
+        if (hold_active_.load(std::memory_order_acquire)) {
+            capture_.end_hold();
+            hold_active_.store(false, std::memory_order_release);
+        }
+        while (jobs_.try_pop()) {}
+        while (events_.try_pop()) {}
+        store_.release();
+        capture_.reset();
+        renderer_.reset();
+        reset_keyed_voices();
+        mode_ = Mode::Live;
+        pending_sequence_ = 0;
+        active_view_ = {};
+        pending_cancelled_ = false;
+        retry_freeze_after_pending_ = false;
+        last_freeze_ = false;
+        fade_position_ = 0;
+        fade_frames_ = 0;
+        sample_frames_.store(0, std::memory_order_relaxed);
+        audio_safe_generation_.store(0, std::memory_order_release);
+        freeze_requested_.store(false, std::memory_order_release);
+        pending_.store(false, std::memory_order_release);
+        frozen_.store(false, std::memory_order_release);
+        captures_completed_.store(0, std::memory_order_relaxed);
+        materialize_failures_.store(0, std::memory_order_relaxed);
+        buffer_shape_mismatches_.store(0, std::memory_order_relaxed);
+    }
+
+    void process(audio::BufferView<float> live, const FreezeLoopSamplerControls& controls) noexcept {
+        if (!prepared_.load(std::memory_order_acquire) || live.empty()) return;
+        if (live.num_channels() != config_.num_channels ||
+            live.num_samples() > config_.max_block_frames) {
+            buffer_shape_mismatches_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const auto frames = static_cast<std::uint64_t>(live.num_samples());
+        const bool want_freeze = controls.freeze;
+        freeze_requested_.store(want_freeze, std::memory_order_release);
+
+        consume_events();
+        capture_.append(live, frames);
+
+        if (want_freeze && (!last_freeze_ || retry_freeze_after_pending_)) {
+            begin_freeze(controls);
+        }
+        if (!want_freeze && last_freeze_) begin_release();
+        last_freeze_ = want_freeze;
+
+        render_if_needed(live, frames, controls);
+    }
+
+    FreezeLoopSamplerStatus status() const noexcept {
+        return {
+            prepared_.load(std::memory_order_acquire),
+            freeze_requested_.load(std::memory_order_acquire),
+            pending_.load(std::memory_order_acquire),
+            frozen_.load(std::memory_order_acquire),
+            hold_active_.load(std::memory_order_acquire),
+            sample_frames_.load(std::memory_order_relaxed),
+            captures_completed_.load(std::memory_order_relaxed),
+            materialize_failures_.load(std::memory_order_relaxed),
+            capture_.frames_discarded_while_held(),
+            buffer_shape_mismatches_.load(std::memory_order_relaxed),
+        };
+    }
+
+    std::optional<FreezeLoopSamplerSnapshot> frozen_snapshot() const {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        if (!persisted_snapshot_) return std::nullopt;
+        return persisted_snapshot_;
+    }
+
+    bool restore_frozen_snapshot(const FreezeLoopSamplerSnapshot& snapshot) {
+        if (!prepared_.load(std::memory_order_acquire) || !snapshot_valid(snapshot))
+            return false;
+
+        const auto frames = static_cast<std::size_t>(snapshot.num_frames);
+        for (std::uint32_t ch = 0; ch < snapshot.num_channels; ++ch) {
+            publish_ptrs_[ch] = snapshot.planar_samples.data() + frames * ch;
+        }
+        const audio::BufferView<const float> publish_view(publish_ptrs_.data(),
+                                                          snapshot.num_channels,
+                                                          frames);
+        if (!store_.publish(publish_view,
+                            snapshot.num_frames,
+                            snapshot.sample_rate,
+                            audio_safe_generation_.load(std::memory_order_acquire))) {
+            return false;
+        }
+
+        const auto view = store_.read_published_view();
+        if (!configure_renderer(view, snapshot.loop_crossfade_ms)) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_ = snapshot;
+        }
+
+        active_view_ = view;
+        audio_safe_generation_.store(active_view_.generation, std::memory_order_release);
+        sample_frames_.store(snapshot.num_frames, std::memory_order_relaxed);
+        captures_completed_.fetch_add(1, std::memory_order_relaxed);
+        pending_.store(false, std::memory_order_release);
+        hold_active_.store(false, std::memory_order_release);
+        freeze_requested_.store(true, std::memory_order_release);
+        retry_freeze_after_pending_ = false;
+        pending_cancelled_ = false;
+        last_freeze_ = true;
+        fade_position_ = 0;
+        fade_frames_ = 0;
+        mode_ = Mode::Frozen;
+        frozen_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void clear_frozen_snapshot() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_.reset();
+        }
+        active_view_ = {};
+        active_loop_region_ = {};
+        active_source_frames_ = 0;
+        renderer_.reset();
+        reset_keyed_voices();
+        sample_frames_.store(0, std::memory_order_relaxed);
+        frozen_.store(false, std::memory_order_release);
+        freeze_requested_.store(false, std::memory_order_release);
+        pending_.store(false, std::memory_order_release);
+        hold_active_.store(false, std::memory_order_release);
+        mode_ = Mode::Live;
+        last_freeze_ = false;
+        retry_freeze_after_pending_ = false;
+        pending_cancelled_ = false;
+        fade_position_ = 0;
+        fade_frames_ = 0;
+    }
+
+private:
+    static constexpr std::size_t kMaxChannels = 16;
+    static constexpr std::size_t kMaxKeyedVoices = 8;
+    static constexpr double kSemitoneRatio = 1.0594630943592952646;
+
+    enum class Mode : std::uint8_t {
+        Live,
+        FreezingPending,
+        FadeToFrozen,
+        Frozen,
+        FadeToLive,
+    };
+
+    struct MaterializeJob {
+        std::uint64_t sequence = 0;
+        audio::RollingAudioCaptureSnapshot snapshot;
+        double loop_crossfade_ms = 30.0;
+    };
+
+    struct MaterializeEvent {
+        std::uint64_t sequence = 0;
+        bool ok = false;
+        std::uint64_t frames = 0;
+        double loop_crossfade_ms = 30.0;
+    };
+
+    struct KeyedVoice {
+        audio::LoopRenderer renderer;
+        int note = -1;
+        float gain = 0.0f;
+        bool held = false;
+        std::uint64_t age = 0;
+    };
+
+    static double clamp_double(double value, double lo, double hi) noexcept {
+        if (!std::isfinite(value)) return lo;
+        return std::clamp(value, lo, hi);
+    }
+
+    bool snapshot_valid(const FreezeLoopSamplerSnapshot& snapshot) const noexcept {
+        if (snapshot.num_channels == 0 ||
+            snapshot.num_channels > config_.num_channels ||
+            snapshot.num_channels > kMaxChannels ||
+            snapshot.num_frames < 2 ||
+            snapshot.num_frames > store_.max_frames_per_slot() ||
+            !(snapshot.sample_rate > 0.0) ||
+            !std::isfinite(snapshot.sample_rate) ||
+            !std::isfinite(snapshot.loop_crossfade_ms)) {
+            return false;
+        }
+        if (snapshot.num_frames > std::numeric_limits<std::size_t>::max() /
+                                      snapshot.num_channels) {
+            return false;
+        }
+        const auto expected = static_cast<std::size_t>(snapshot.num_frames) *
+                              static_cast<std::size_t>(snapshot.num_channels);
+        return snapshot.planar_samples.size() == expected;
+    }
+
+    void remember_frozen_snapshot(audio::BufferView<const float> source,
+                                  std::uint64_t frames,
+                                  double sample_rate,
+                                  double loop_crossfade_ms) noexcept {
+        if (source.num_channels() == 0 ||
+            source.num_channels() > kMaxChannels ||
+            frames < 2 ||
+            frames > std::numeric_limits<std::size_t>::max() ||
+            source.num_samples() < static_cast<std::size_t>(frames) ||
+            !(sample_rate > 0.0) ||
+            !std::isfinite(sample_rate)) {
+            return;
+        }
+
+        FreezeLoopSamplerSnapshot snapshot;
+        snapshot.num_channels = static_cast<std::uint32_t>(source.num_channels());
+        snapshot.num_frames = frames;
+        snapshot.sample_rate = sample_rate;
+        snapshot.loop_crossfade_ms = loop_crossfade_ms;
+        try {
+            const auto frame_count = static_cast<std::size_t>(frames);
+            snapshot.planar_samples.resize(frame_count * source.num_channels());
+            for (std::size_t ch = 0; ch < source.num_channels(); ++ch) {
+                const auto* src = source.channel_ptr(ch);
+                auto* dst = snapshot.planar_samples.data() + frame_count * ch;
+                std::copy(src, src + frame_count, dst);
+            }
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            persisted_snapshot_ = std::move(snapshot);
+        } catch (...) {
+        }
+    }
+
+    void begin_freeze(const FreezeLoopSamplerControls& controls) noexcept {
+        if (pending_.load(std::memory_order_acquire) ||
+            hold_active_.load(std::memory_order_acquire)) {
+            if (pending_cancelled_) retry_freeze_after_pending_ = true;
+            return;
+        }
+        if (mode_ == Mode::FadeToFrozen || mode_ == Mode::Frozen) return;
+
+        const auto requested_seconds = clamp_double(controls.capture_seconds,
+                                                    0.05,
+                                                    config_.max_capture_seconds);
+        const auto requested_frames = static_cast<std::uint64_t>(
+            std::max(1.0, std::ceil(requested_seconds * config_.sample_rate)));
+        const auto snapshot = capture_.begin_hold_last(requested_frames);
+        if (!snapshot.valid) {
+            retry_freeze_after_pending_ = true;
+            return;
+        }
+
+        const auto seq = ++pending_sequence_;
+        const auto loop_crossfade_ms = clamp_double(controls.loop_crossfade_ms, 0.0, 250.0);
+        MaterializeJob job{seq, snapshot, loop_crossfade_ms};
+        if (!jobs_.try_push(job)) {
+            capture_.end_hold();
+            hold_active_.store(false, std::memory_order_release);
+            retry_freeze_after_pending_ = true;
+            return;
+        }
+
+        pending_cancelled_ = false;
+        retry_freeze_after_pending_ = false;
+        pending_.store(true, std::memory_order_release);
+        hold_active_.store(true, std::memory_order_release);
+        mode_ = Mode::FreezingPending;
+    }
+
+    void begin_release() noexcept {
+        if (mode_ == Mode::Frozen || mode_ == Mode::FadeToFrozen) {
+            mode_ = Mode::FadeToLive;
+            fade_position_ = 0;
+            fade_frames_ = default_transition_frames();
+        } else if (mode_ == Mode::FreezingPending) {
+            pending_cancelled_ = true;
+            retry_freeze_after_pending_ = false;
+            mode_ = Mode::Live;
+            frozen_.store(false, std::memory_order_release);
+        }
+    }
+
+    std::uint64_t default_transition_frames() const noexcept {
+        return std::max<std::uint64_t>(1, static_cast<std::uint64_t>(
+            std::ceil(config_.sample_rate * 0.025)));
+    }
+
+    std::uint64_t loop_crossfade_frames(std::uint64_t sample_frames,
+                                        double loop_crossfade_ms) const noexcept {
+        if (sample_frames < 8 || loop_crossfade_ms <= 0.0) return 0;
+        const auto max_xfade = std::max<std::uint64_t>(1, sample_frames / 4);
+        const auto requested = static_cast<std::uint64_t>(
+            std::ceil(config_.sample_rate * (loop_crossfade_ms / 1000.0)));
+        return std::min<std::uint64_t>(max_xfade, requested);
+    }
+
+    void consume_events() noexcept {
+        while (auto event = events_.try_pop()) {
+            if (event->sequence != pending_sequence_) continue;
+
+            pending_.store(false, std::memory_order_release);
+            if (hold_active_.load(std::memory_order_acquire)) {
+                capture_.end_hold();
+                hold_active_.store(false, std::memory_order_release);
+            }
+
+            const bool want_freeze_now = freeze_requested_.load(std::memory_order_acquire);
+            const bool cancelled = pending_cancelled_;
+            pending_cancelled_ = false;
+            if (cancelled) {
+                if (!want_freeze_now) retry_freeze_after_pending_ = false;
+                mode_ = Mode::Live;
+                frozen_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            if (!event->ok) {
+                materialize_failures_.fetch_add(1, std::memory_order_relaxed);
+                retry_freeze_after_pending_ = false;
+                mode_ = Mode::Live;
+                frozen_.store(false, std::memory_order_release);
+                continue;
+            }
+            if (!want_freeze_now) {
+                retry_freeze_after_pending_ = false;
+                mode_ = Mode::Live;
+                frozen_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            const auto view = store_.read_published_view();
+            if (!configure_renderer(view, event->loop_crossfade_ms)) {
+                materialize_failures_.fetch_add(1, std::memory_order_relaxed);
+                mode_ = Mode::Live;
+                frozen_.store(false, std::memory_order_release);
+                continue;
+            }
+
+            active_view_ = view;
+            retry_freeze_after_pending_ = false;
+            audio_safe_generation_.store(active_view_.generation, std::memory_order_release);
+            sample_frames_.store(event->frames, std::memory_order_relaxed);
+            captures_completed_.fetch_add(1, std::memory_order_relaxed);
+            mode_ = Mode::FadeToFrozen;
+            fade_position_ = 0;
+            fade_frames_ = default_transition_frames();
+            frozen_.store(true, std::memory_order_release);
+        }
+    }
+
+    bool configure_renderer(const audio::PublishedSampleView& view,
+                            double loop_crossfade_ms) noexcept {
+        if (!view.valid || view.num_frames < 2 || view.num_channels == 0) return false;
+        audio::LoopRegion region;
+        region.start_frame = 0;
+        region.end_frame = view.num_frames;
+        region.crossfade_frames = loop_crossfade_frames(view.num_frames, loop_crossfade_ms);
+        region.source_sample_rate = view.sample_rate;
+        region.playback_mode = audio::LoopPlaybackMode::Forward;
+        region.crossfade_curve = audio::LoopCrossfadeCurve::EqualPower;
+        region.interpolation = audio::LoopInterpolationMode::Linear;
+        region.snap_policy = audio::LoopSnapPolicy::ValueDirection;
+
+        if (!renderer_.set_region(region, view.num_frames)) return false;
+        renderer_.set_start_fade_frames(0);
+        renderer_.set_stop_fade_frames(0);
+        base_playback_rate_ = view.sample_rate > 0.0 ? view.sample_rate / config_.sample_rate : 1.0;
+        active_loop_region_ = region;
+        active_source_frames_ = view.num_frames;
+        reset_keyed_voices();
+        renderer_.set_playback_rate(base_playback_rate_);
+        renderer_.start();
+        return true;
+    }
+
+    void render_if_needed(audio::BufferView<float> live,
+                          std::uint64_t frames,
+                          const FreezeLoopSamplerControls& controls) noexcept {
+        if (mode_ != Mode::FadeToFrozen && mode_ != Mode::Frozen && mode_ != Mode::FadeToLive) {
+            return;
+        }
+        if (live.num_samples() > render_scratch_.num_samples() ||
+            live.num_channels() > render_scratch_.num_channels()) {
+            mode_ = Mode::Live;
+            frozen_.store(false, std::memory_order_release);
+            return;
+        }
+
+        std::array<const float*, kMaxChannels> source_ptrs{};
+        if (active_view_.num_channels > source_ptrs.size() ||
+            !store_.populate_channel_ptrs(active_view_, source_ptrs.data(), source_ptrs.size())) {
+            mode_ = Mode::Live;
+            frozen_.store(false, std::memory_order_release);
+            return;
+        }
+
+        audio::BufferView<const float> source(source_ptrs.data(),
+                                              active_view_.num_channels,
+                                              static_cast<std::size_t>(active_view_.num_frames));
+        handle_keyed_midi(controls);
+        const bool keyed_active = render_keyed_voices_if_active(source, live.num_samples(), frames);
+        auto scratch = keyed_active
+            ? keyed_mix_.view().slice(0, live.num_samples())
+            : render_scratch_.view().slice(0, live.num_samples());
+        if (!keyed_active) renderer_.render(source, scratch, frames);
+
+        for (std::uint64_t i = 0; i < frames; ++i) {
+            const auto gains = gains_for_next_frame();
+            for (std::size_t ch = 0; ch < live.num_channels(); ++ch) {
+                auto* out = live.channel_ptr(ch);
+                const auto frozen_sample = ch < scratch.num_channels() ? scratch.channel_ptr(ch)[i] : 0.0f;
+                out[i] = static_cast<float>(static_cast<double>(out[i]) * gains.live +
+                                            static_cast<double>(frozen_sample) * gains.frozen);
+            }
+        }
+    }
+
+    static double note_ratio(int note, int root_note) noexcept {
+        return std::pow(kSemitoneRatio, static_cast<double>(note - root_note));
+    }
+
+    void handle_keyed_midi(const FreezeLoopSamplerControls& controls) noexcept {
+        if (controls.midi == nullptr) return;
+        const int root = std::clamp(controls.root_note, 0, 127);
+        for (const auto& event : *controls.midi) {
+            if (event.is_note_on() && event.velocity() > 0) {
+                const int note = static_cast<int>(event.note());
+                start_keyed_voice(note,
+                                  static_cast<float>(event.velocity()) / 127.0f,
+                                  root);
+            } else if (event.is_note_off() || event.is_note_on()) {
+                const int note = static_cast<int>(event.note());
+                stop_keyed_voice(note);
+            }
+        }
+    }
+
+    void start_keyed_voice(int note, float gain, int root_note) noexcept {
+        if (active_source_frames_ < 2) return;
+        auto* voice = find_voice_for_note(note);
+        if (voice == nullptr) voice = find_free_voice();
+        if (voice == nullptr) voice = find_oldest_voice();
+        if (voice == nullptr) return;
+
+        voice->renderer.reset();
+        if (!voice->renderer.set_region(active_loop_region_, active_source_frames_)) {
+            *voice = {};
+            return;
+        }
+        voice->renderer.set_start_fade_frames(std::min<std::uint64_t>(64, active_source_frames_ / 4));
+        voice->renderer.set_stop_fade_frames(std::min<std::uint64_t>(64, active_source_frames_ / 4));
+        voice->renderer.set_playback_rate(clamp_double(base_playback_rate_ * note_ratio(note, root_note),
+                                                       0.03125,
+                                                       32.0));
+        voice->renderer.start();
+        voice->note = note;
+        voice->gain = std::clamp(gain, 0.0f, 1.0f);
+        voice->held = true;
+        voice->age = ++voice_age_counter_;
+    }
+
+    void stop_keyed_voice(int note) noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note == note && voice.held) {
+                voice.held = false;
+                voice.renderer.stop();
+            }
+        }
+    }
+
+    KeyedVoice* find_voice_for_note(int note) noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note == note) return &voice;
+        }
+        return nullptr;
+    }
+
+    KeyedVoice* find_free_voice() noexcept {
+        for (auto& voice : keyed_voices_) {
+            if (voice.note < 0 || !voice.renderer.active()) return &voice;
+        }
+        return nullptr;
+    }
+
+    KeyedVoice* find_oldest_voice() noexcept {
+        KeyedVoice* oldest = nullptr;
+        for (auto& voice : keyed_voices_) {
+            if (oldest == nullptr || voice.age < oldest->age) oldest = &voice;
+        }
+        return oldest;
+    }
+
+    bool render_keyed_voices_if_active(audio::BufferView<const float> source,
+                                       std::size_t num_samples,
+                                       std::uint64_t frames) noexcept {
+        bool any_active = false;
+        for (const auto& voice : keyed_voices_) {
+            if (voice.note >= 0 && voice.renderer.active()) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active) return false;
+
+        auto mix = keyed_mix_.view().slice(0, num_samples);
+        mix.clear();
+        auto scratch = render_scratch_.view().slice(0, num_samples);
+        for (auto& voice : keyed_voices_) {
+            if (voice.note < 0 || !voice.renderer.active()) continue;
+            voice.renderer.render(source, scratch, frames);
+            for (std::size_t ch = 0; ch < mix.num_channels(); ++ch) {
+                auto* dst = mix.channel_ptr(ch);
+                const auto* src = ch < scratch.num_channels() ? scratch.channel_ptr(ch) : nullptr;
+                if (src == nullptr) continue;
+                for (std::size_t i = 0; i < num_samples; ++i) {
+                    dst[i] += src[i] * voice.gain;
+                }
+            }
+            if (!voice.renderer.active()) voice = {};
+        }
+        return true;
+    }
+
+    void reset_keyed_voices() noexcept {
+        for (auto& voice : keyed_voices_) {
+            voice.renderer.reset();
+            voice = {};
+        }
+        voice_age_counter_ = 0;
+    }
+
+    struct MixGains {
+        double live = 1.0;
+        double frozen = 0.0;
+    };
+
+    MixGains gains_for_next_frame() noexcept {
+        if (mode_ == Mode::Frozen) return {0.0, 1.0};
+        if (fade_frames_ == 0) return mode_ == Mode::FadeToLive ? MixGains{1.0, 0.0}
+                                                                 : MixGains{0.0, 1.0};
+        const auto t = std::clamp(static_cast<double>(fade_position_) /
+                                  static_cast<double>(fade_frames_),
+                                  0.0,
+                                  1.0);
+        ++fade_position_;
+        if (mode_ == Mode::FadeToFrozen) {
+            if (fade_position_ >= fade_frames_) mode_ = Mode::Frozen;
+            return {1.0 - t, t};
+        }
+        if (mode_ == Mode::FadeToLive) {
+            if (fade_position_ >= fade_frames_) {
+                mode_ = Mode::Live;
+                frozen_.store(false, std::memory_order_release);
+                renderer_.reset();
+                reset_keyed_voices();
+            }
+            return {t, 1.0 - t};
+        }
+        return {0.0, 1.0};
+    }
+
+    void worker_loop() noexcept {
+        using namespace std::chrono_literals;
+        while (running_.load(std::memory_order_acquire)) {
+            auto job = jobs_.try_pop();
+            if (!job) {
+                // Demo policy: light polling keeps this helper independent of a
+                // reusable background-work primitive.
+                std::this_thread::sleep_for(1ms);
+                continue;
+            }
+
+            auto destination = materialize_buffer_.view().slice(
+                0, static_cast<std::size_t>(job->snapshot.frame_count));
+            const auto result = capture_.materialize_held(job->snapshot, destination);
+            bool ok = result.status == audio::RollingAudioCaptureMaterializeStatus::Ok &&
+                      result.frames_copied > 1;
+            if (ok) {
+                for (std::size_t ch = 0; ch < destination.num_channels(); ++ch) {
+                    publish_ptrs_[ch] = destination.channel_ptr(ch);
+                }
+                const audio::BufferView<const float> publish_view(publish_ptrs_.data(),
+                                                                  destination.num_channels(),
+                                                                  static_cast<std::size_t>(result.frames_copied));
+                ok = store_.publish(publish_view,
+                                    result.frames_copied,
+                                    config_.sample_rate,
+                                    audio_safe_generation_.load(std::memory_order_acquire));
+                if (ok) {
+                    remember_frozen_snapshot(publish_view,
+                                             result.frames_copied,
+                                             config_.sample_rate,
+                                             job->loop_crossfade_ms);
+                }
+            }
+            MaterializeEvent event{job->sequence,
+                                   ok,
+                                   ok ? result.frames_copied : 0,
+                                   job->loop_crossfade_ms};
+            while (running_.load(std::memory_order_acquire) && !events_.try_push(event)) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+    }
+
+    FreezeLoopSamplerConfig config_;
+    audio::RollingAudioCaptureBuffer capture_;
+    audio::PublishedSampleStore store_;
+    audio::LoopRenderer renderer_;
+    std::array<KeyedVoice, kMaxKeyedVoices> keyed_voices_{};
+    audio::Buffer<float> materialize_buffer_;
+    audio::Buffer<float> render_scratch_;
+    audio::Buffer<float> keyed_mix_;
+    std::vector<const float*> publish_ptrs_;
+    runtime::SpscQueue<MaterializeJob, 4> jobs_;
+    runtime::SpscQueue<MaterializeEvent, 4> events_;
+    std::thread worker_;
+    mutable std::mutex snapshot_mutex_;
+    std::optional<FreezeLoopSamplerSnapshot> persisted_snapshot_;
+
+    audio::PublishedSampleView active_view_;
+    audio::LoopRegion active_loop_region_;
+    std::uint64_t active_source_frames_ = 0;
+    double base_playback_rate_ = 1.0;
+    std::uint64_t voice_age_counter_ = 0;
+    std::uint64_t pending_sequence_ = 0;
+    std::uint64_t fade_position_ = 0;
+    std::uint64_t fade_frames_ = 0;
+    Mode mode_ = Mode::Live;
+    bool pending_cancelled_ = false;
+    bool retry_freeze_after_pending_ = false;
+    bool last_freeze_ = false;
+
+    std::atomic<bool> running_{false};
+    std::atomic<bool> prepared_{false};
+    std::atomic<bool> freeze_requested_{false};
+    std::atomic<bool> pending_{false};
+    std::atomic<bool> frozen_{false};
+    std::atomic<bool> hold_active_{false};
+    std::atomic<std::uint64_t> audio_safe_generation_{0};
+    std::atomic<std::uint64_t> sample_frames_{0};
+    std::atomic<std::uint64_t> captures_completed_{0};
+    std::atomic<std::uint64_t> materialize_failures_{0};
+    std::atomic<std::uint64_t> buffer_shape_mismatches_{0};
+};
+
+}  // namespace pulp::examples::accompanist_v2
